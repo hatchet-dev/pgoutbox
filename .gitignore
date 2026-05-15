@@ -1,0 +1,41 @@
+# Claude Code
+.claude/
+
+# Compiled binaries and test artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage and profiling output
+*.coverprofile
+coverage.txt
+coverage.html
+*.prof
+cpu.out
+mem.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Vendor directory (uncomment if not vendoring)
+# vendor/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local

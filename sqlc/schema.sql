@@ -1,0 +1,7 @@
+CREATE TABLE messages (
+    id BIGINT GENERATED ALWAYS AS IDENTITY,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    topic TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    CONSTRAINT v1_message_pkey PRIMARY KEY (topic, id)
+);
