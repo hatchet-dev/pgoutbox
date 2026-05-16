@@ -14,3 +14,32 @@ type Message struct {
 	Topic      string             `json:"topic"`
 	Payload    []byte             `json:"payload"`
 }
+
+type TopicMetum struct {
+	Topic             string             `json:"topic"`
+	NextID            int64              `json:"next_id"`
+	AckedID           int64              `json:"acked_id"`
+	PartitionSize     int64              `json:"partition_size"`
+	PartitionCount    int32              `json:"partition_count"`
+	FillSeqName       string             `json:"fill_seq_name"`
+	LeaseHolder       pgtype.Text        `json:"lease_holder"`
+	LeaseExpiresAt    pgtype.Timestamptz `json:"lease_expires_at"`
+	LeaseHighID       pgtype.Int8        `json:"lease_high_id"`
+	WritesSinceResize int64              `json:"writes_since_resize"`
+	AcksSinceResize   int64              `json:"acks_since_resize"`
+	LastWriteAt       pgtype.Timestamptz `json:"last_write_at"`
+	LastProcessAt     pgtype.Timestamptz `json:"last_process_at"`
+	ResizedAt         pgtype.Timestamptz `json:"resized_at"`
+}
+
+type TopicPartition struct {
+	Topic          string             `json:"topic"`
+	PartitionIndex int32              `json:"partition_index"`
+	Relname        string             `json:"relname"`
+	IDFrom         int64              `json:"id_from"`
+	IDTo           int64              `json:"id_to"`
+	PartitionSize  int64              `json:"partition_size"`
+	HighWaterID    int64              `json:"high_water_id"`
+	Status         string             `json:"status"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}

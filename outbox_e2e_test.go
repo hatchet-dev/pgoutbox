@@ -112,6 +112,77 @@ func countMessages(t *testing.T, ctx context.Context, schema, topic string) int 
 	return n
 }
 
+func topicAckedID(t *testing.T, ctx context.Context, schema, topic string) int64 {
+	t.Helper()
+
+	var ackedID int64
+	query := fmt.Sprintf("SELECT acked_id FROM %s.topic_meta WHERE topic = $1", pgx.Identifier{schema}.Sanitize())
+	err := sharedPool.QueryRow(ctx, query, topic).Scan(&ackedID)
+	require.NoError(t, err)
+	return ackedID
+}
+
+func partitionCount(t *testing.T, ctx context.Context, schema, topic string) int {
+	t.Helper()
+
+	var n int
+	query := fmt.Sprintf("SELECT count(*) FROM %s.topic_partitions WHERE topic = $1", pgx.Identifier{schema}.Sanitize())
+	err := sharedPool.QueryRow(ctx, query, topic).Scan(&n)
+	require.NoError(t, err)
+	return n
+}
+
+func maxPartitionIndex(t *testing.T, ctx context.Context, schema, topic string) int {
+	t.Helper()
+
+	var idx int
+	query := fmt.Sprintf("SELECT COALESCE(MAX(partition_index), 0) FROM %s.topic_partitions WHERE topic = $1", pgx.Identifier{schema}.Sanitize())
+	err := sharedPool.QueryRow(ctx, query, topic).Scan(&idx)
+	require.NoError(t, err)
+	return idx
+}
+
+func partitionStatus(t *testing.T, ctx context.Context, schema, topic string, index int) string {
+	t.Helper()
+
+	var status string
+	query := fmt.Sprintf("SELECT status FROM %s.topic_partitions WHERE topic = $1 AND partition_index = $2", pgx.Identifier{schema}.Sanitize())
+	err := sharedPool.QueryRow(ctx, query, topic, index).Scan(&status)
+	require.NoError(t, err)
+	return status
+}
+
+func tableReloptions(t *testing.T, ctx context.Context, schema, table string) []string {
+	t.Helper()
+
+	var opts []string
+	err := sharedPool.QueryRow(
+		ctx,
+		"SELECT COALESCE(reloptions, ARRAY[]::text[]) FROM pg_class WHERE oid = $1::regclass",
+		pgx.Identifier{schema, table}.Sanitize(),
+	).Scan(&opts)
+	require.NoError(t, err)
+	return opts
+}
+
+func messageIDs(t *testing.T, ctx context.Context, schema, topic string) []int64 {
+	t.Helper()
+
+	query := fmt.Sprintf("SELECT id FROM %s.messages WHERE topic = $1 ORDER BY id", pgx.Identifier{schema}.Sanitize())
+	rows, err := sharedPool.Query(ctx, query, topic)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
+	return ids
+}
+
 func mustPayload(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)
@@ -151,7 +222,8 @@ func TestOutbox_AddAndProcessMessages(t *testing.T) {
 
 	received := flusher.Received()
 	require.Len(t, received, 3)
-	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"), "flushed messages should be deleted")
+	assert.Equal(t, int64(3), topicAckedID(t, ctx, schema, "orders"))
+	assert.Equal(t, 3, countMessages(t, ctx, schema, "orders"), "active partition rows remain append-only until their partition is dropped")
 
 	// Calling ProcessMessages again with nothing pending should be a no-op.
 	_, err = outbox.ProcessMessages(ctx, "orders")
@@ -271,6 +343,7 @@ func TestOutbox_FlusherErrorLeavesMessages(t *testing.T) {
 	// Failed flush must NOT delete the rows — the outbox guarantee is that
 	// messages survive until a Flusher reports success.
 	assert.Equal(t, 2, countMessages(t, ctx, schema, "orders"))
+	assert.Equal(t, int64(0), topicAckedID(t, ctx, schema, "orders"))
 
 	// Once the flusher recovers, the same messages should be delivered.
 	flusher.mu.Lock()
@@ -280,7 +353,8 @@ func TestOutbox_FlusherErrorLeavesMessages(t *testing.T) {
 	_, err = outbox.ProcessMessages(ctx, "orders")
 	require.NoError(t, err)
 	assert.Len(t, flusher.Received(), 2)
-	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"))
+	assert.Equal(t, int64(2), topicAckedID(t, ctx, schema, "orders"))
+	assert.Equal(t, 2, countMessages(t, ctx, schema, "orders"))
 }
 
 func TestOutbox_BatchSizeIsRespected(t *testing.T) {
@@ -315,27 +389,209 @@ func TestOutbox_BatchSizeIsRespected(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, processed, 1, "ProcessMessages should return exactly batchSize messages")
 	assert.Len(t, flusher.Received(), 1)
-	assert.Equal(t, 2, countMessages(t, ctx, schema, "orders"))
+	assert.Equal(t, int64(1), topicAckedID(t, ctx, schema, "orders"))
+	assert.Equal(t, 3, countMessages(t, ctx, schema, "orders"))
 
 	// Second call: one more.
 	processed, err = outbox.ProcessMessages(ctx, "orders")
 	require.NoError(t, err)
 	assert.Len(t, processed, 1)
 	assert.Len(t, flusher.Received(), 2)
-	assert.Equal(t, 1, countMessages(t, ctx, schema, "orders"))
+	assert.Equal(t, int64(2), topicAckedID(t, ctx, schema, "orders"))
+	assert.Equal(t, 3, countMessages(t, ctx, schema, "orders"))
 
 	// Third call: last one.
 	processed, err = outbox.ProcessMessages(ctx, "orders")
 	require.NoError(t, err)
 	assert.Len(t, processed, 1)
 	assert.Len(t, flusher.Received(), 3)
-	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"))
+	assert.Equal(t, int64(3), topicAckedID(t, ctx, schema, "orders"))
+	assert.Equal(t, 3, countMessages(t, ctx, schema, "orders"))
 
 	// Fourth call: nothing left, no-op.
 	processed, err = outbox.ProcessMessages(ctx, "orders")
 	require.NoError(t, err)
 	assert.Empty(t, processed)
 	assert.Len(t, flusher.Received(), 3)
+}
+
+func TestOutbox_CreatesTopicPartitionsAheadOfWrites(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	outbox, err := pgoutbox.NewOutbox(
+		sharedPool,
+		pgoutbox.WithSchema(schema),
+		pgoutbox.WithDefaultPartitionSize(2),
+		pgoutbox.WithDefaultPartitionCount(2),
+	)
+	require.NoError(t, err)
+
+	tx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, tx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 1})},
+	}))
+	require.NoError(t, tx.Commit(ctx))
+
+	assert.Equal(t, 3, partitionCount(t, ctx, schema, "orders"), "current partition plus N future partitions should be ready")
+	assert.Equal(t, "active", partitionStatus(t, ctx, schema, "orders", 0))
+	assert.Equal(t, "future", partitionStatus(t, ctx, schema, "orders", 1))
+	assert.Equal(t, "future", partitionStatus(t, ctx, schema, "orders", 2))
+}
+
+func TestOutbox_RollsOverAndSealsFullPartitions(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	outbox, err := pgoutbox.NewOutbox(
+		sharedPool,
+		pgoutbox.WithSchema(schema),
+		pgoutbox.WithDefaultPartitionSize(2),
+		pgoutbox.WithDefaultPartitionCount(1),
+	)
+	require.NoError(t, err)
+
+	tx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, tx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 1})},
+		{Payload: mustPayload(t, map[string]int{"id": 2})},
+		{Payload: mustPayload(t, map[string]int{"id": 3})},
+	}))
+	require.NoError(t, tx.Commit(ctx))
+
+	assert.Equal(t, "sealed", partitionStatus(t, ctx, schema, "orders", 0))
+	assert.Equal(t, "active", partitionStatus(t, ctx, schema, "orders", 1))
+	assert.Equal(t, "future", partitionStatus(t, ctx, schema, "orders", 2))
+}
+
+func TestOutbox_SequenceOvercountOnlyCreatesExtraFuturePartitions(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	outbox, err := pgoutbox.NewOutbox(
+		sharedPool,
+		pgoutbox.WithSchema(schema),
+		pgoutbox.WithDefaultPartitionSize(2),
+		pgoutbox.WithDefaultPartitionCount(1),
+	)
+	require.NoError(t, err)
+
+	tx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, tx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 1})},
+	}))
+	require.NoError(t, tx.Commit(ctx))
+
+	rollbackTx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, rollbackTx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 2})},
+		{Payload: mustPayload(t, map[string]int{"id": 3})},
+	}))
+	require.NoError(t, rollbackTx.Rollback(ctx))
+
+	tx, err = sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, tx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 4})},
+	}))
+	require.NoError(t, tx.Commit(ctx))
+
+	assert.Equal(t, []int64{1, 2}, messageIDs(t, ctx, schema, "orders"), "transactional IDs should not inherit sequence gaps")
+	assert.GreaterOrEqual(t, maxPartitionIndex(t, ctx, schema, "orders"), 2, "sequence overcount should only move the proactive partition horizon forward")
+}
+
+func TestOutbox_DropsSealedAckedPartitions(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	outbox, err := pgoutbox.NewOutbox(
+		sharedPool,
+		pgoutbox.WithSchema(schema),
+		pgoutbox.WithBatchSize(2),
+		pgoutbox.WithDefaultPartitionSize(2),
+		pgoutbox.WithDefaultPartitionCount(1),
+	)
+	require.NoError(t, err)
+
+	flusher := &captureFlusher{}
+	outbox.AddFlusher("orders", flusher)
+
+	tx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, tx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 1})},
+		{Payload: mustPayload(t, map[string]int{"id": 2})},
+		{Payload: mustPayload(t, map[string]int{"id": 3})},
+	}))
+	require.NoError(t, tx.Commit(ctx))
+
+	processed, err := outbox.ProcessMessages(ctx, "orders")
+	require.NoError(t, err)
+	require.Len(t, processed, 2)
+
+	assert.Equal(t, "dropped", partitionStatus(t, ctx, schema, "orders", 0))
+	assert.Equal(t, 1, countMessages(t, ctx, schema, "orders"), "dropping the sealed first partition should leave only the active partition row")
+}
+
+func TestOutbox_ConcurrentProcessorsDoNotDoubleFlushLeasedRange(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	flusher := &captureFlusher{}
+	outbox.AddFlusher("orders", flusher)
+
+	tx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, tx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 1})},
+		{Payload: mustPayload(t, map[string]int{"id": 2})},
+		{Payload: mustPayload(t, map[string]int{"id": 3})},
+	}))
+	require.NoError(t, tx.Commit(ctx))
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Go(func() {
+			_, err := outbox.ProcessMessages(ctx, "orders")
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	assert.Len(t, flusher.Received(), 3)
+	assert.Equal(t, int64(3), topicAckedID(t, ctx, schema, "orders"))
 }
 
 // messagesTableExists returns true if the messages table is present in the
@@ -412,7 +668,8 @@ func TestOutbox_ExplicitMigrate(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, processed, 2)
 	assert.Len(t, flusher.Received(), 2)
-	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"))
+	assert.Equal(t, int64(2), topicAckedID(t, ctx, schema, "orders"))
+	assert.Equal(t, 2, countMessages(t, ctx, schema, "orders"))
 }
 
 func TestOutbox_InvalidSchemaNameRejected(t *testing.T) {
@@ -447,4 +704,27 @@ func TestOutbox_TableLandsInConfiguredSchema(t *testing.T) {
 	).Scan(&schemaName)
 	require.NoError(t, err)
 	assert.Equal(t, schema, schemaName)
+}
+
+func TestOutbox_TrackingTablesUseAggressiveAutovacuum(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	_, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	for _, table := range []string{"topic_meta", "topic_partitions"} {
+		opts := tableReloptions(t, ctx, schema, table)
+		assert.Contains(t, opts, "fillfactor=70")
+		assert.Contains(t, opts, "autovacuum_vacuum_scale_factor=0.0")
+		assert.Contains(t, opts, "autovacuum_vacuum_threshold=5")
+		assert.Contains(t, opts, "autovacuum_analyze_scale_factor=0.0")
+		assert.Contains(t, opts, "autovacuum_analyze_threshold=5")
+		assert.Contains(t, opts, "autovacuum_vacuum_cost_delay=0")
+		assert.Contains(t, opts, "autovacuum_vacuum_cost_limit=1000")
+	}
 }

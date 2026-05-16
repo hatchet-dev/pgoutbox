@@ -29,6 +29,7 @@ func (r *iteratorForInsertMessage) Next() bool {
 
 func (r iteratorForInsertMessage) Values() ([]interface{}, error) {
 	return []interface{}{
+		r.rows[0].ID,
 		r.rows[0].Topic,
 		r.rows[0].Payload,
 	}, nil
@@ -39,5 +40,5 @@ func (r iteratorForInsertMessage) Err() error {
 }
 
 func (q *Queries) InsertMessage(ctx context.Context, db DBTX, arg []InsertMessageParams) (int64, error) {
-	return db.CopyFrom(ctx, []string{"messages"}, []string{"topic", "payload"}, &iteratorForInsertMessage{rows: arg})
+	return db.CopyFrom(ctx, []string{"messages"}, []string{"id", "topic", "payload"}, &iteratorForInsertMessage{rows: arg})
 }

@@ -11,24 +11,245 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const acquireMessagesByTopic = `-- name: AcquireMessagesByTopic :many
+const ackTopicMessages = `-- name: AckTopicMessages :exec
+UPDATE /*tmpl*/ topic_meta /*tmpl*/
+SET
+    acked_id = $2,
+    acks_since_resize = acks_since_resize + $3,
+    last_process_at = CURRENT_TIMESTAMP,
+    lease_holder = NULL,
+    lease_expires_at = NULL,
+    lease_high_id = NULL
+WHERE
+    topic = $1
+    AND lease_holder = $4
+`
+
+type AckTopicMessagesParams struct {
+	Topic           string      `json:"topic"`
+	AckedID         int64       `json:"acked_id"`
+	AcksSinceResize int64       `json:"acks_since_resize"`
+	LeaseHolder     pgtype.Text `json:"lease_holder"`
+}
+
+func (q *Queries) AckTopicMessages(ctx context.Context, db DBTX, arg AckTopicMessagesParams) error {
+	_, err := db.Exec(ctx, ackTopicMessages,
+		arg.Topic,
+		arg.AckedID,
+		arg.AcksSinceResize,
+		arg.LeaseHolder,
+	)
+	return err
+}
+
+const allocateTopicIds = `-- name: AllocateTopicIds :one
+UPDATE /*tmpl*/ topic_meta /*tmpl*/
+SET
+    next_id = next_id + $1::bigint,
+    writes_since_resize = writes_since_resize + $1::bigint,
+    last_write_at = CURRENT_TIMESTAMP
+WHERE
+    topic = $2
+RETURNING
+    (next_id - $1::bigint)::bigint AS start_id,
+    (next_id - 1)::bigint AS end_id,
+    topic,
+    next_id,
+    acked_id,
+    partition_size,
+    partition_count,
+    fill_seq_name,
+    lease_holder,
+    lease_expires_at,
+    lease_high_id,
+    writes_since_resize,
+    acks_since_resize,
+    last_write_at,
+    last_process_at,
+    resized_at
+`
+
+type AllocateTopicIdsParams struct {
+	Count int64  `json:"count"`
+	Topic string `json:"topic"`
+}
+
+type AllocateTopicIdsRow struct {
+	StartID           int64              `json:"start_id"`
+	EndID             int64              `json:"end_id"`
+	Topic             string             `json:"topic"`
+	NextID            int64              `json:"next_id"`
+	AckedID           int64              `json:"acked_id"`
+	PartitionSize     int64              `json:"partition_size"`
+	PartitionCount    int32              `json:"partition_count"`
+	FillSeqName       string             `json:"fill_seq_name"`
+	LeaseHolder       pgtype.Text        `json:"lease_holder"`
+	LeaseExpiresAt    pgtype.Timestamptz `json:"lease_expires_at"`
+	LeaseHighID       pgtype.Int8        `json:"lease_high_id"`
+	WritesSinceResize int64              `json:"writes_since_resize"`
+	AcksSinceResize   int64              `json:"acks_since_resize"`
+	LastWriteAt       pgtype.Timestamptz `json:"last_write_at"`
+	LastProcessAt     pgtype.Timestamptz `json:"last_process_at"`
+	ResizedAt         pgtype.Timestamptz `json:"resized_at"`
+}
+
+func (q *Queries) AllocateTopicIds(ctx context.Context, db DBTX, arg AllocateTopicIdsParams) (*AllocateTopicIdsRow, error) {
+	row := db.QueryRow(ctx, allocateTopicIds, arg.Count, arg.Topic)
+	var i AllocateTopicIdsRow
+	err := row.Scan(
+		&i.StartID,
+		&i.EndID,
+		&i.Topic,
+		&i.NextID,
+		&i.AckedID,
+		&i.PartitionSize,
+		&i.PartitionCount,
+		&i.FillSeqName,
+		&i.LeaseHolder,
+		&i.LeaseExpiresAt,
+		&i.LeaseHighID,
+		&i.WritesSinceResize,
+		&i.AcksSinceResize,
+		&i.LastWriteAt,
+		&i.LastProcessAt,
+		&i.ResizedAt,
+	)
+	return &i, err
+}
+
+const ensureTopicMeta = `-- name: EnsureTopicMeta :exec
+INSERT INTO /*tmpl*/ topic_meta /*tmpl*/ (
+    topic,
+    partition_size,
+    partition_count,
+    fill_seq_name
+) VALUES ($1, $2, $3, $4)
+ON CONFLICT (topic) DO NOTHING
+`
+
+type EnsureTopicMetaParams struct {
+	Topic          string `json:"topic"`
+	PartitionSize  int64  `json:"partition_size"`
+	PartitionCount int32  `json:"partition_count"`
+	FillSeqName    string `json:"fill_seq_name"`
+}
+
+func (q *Queries) EnsureTopicMeta(ctx context.Context, db DBTX, arg EnsureTopicMetaParams) error {
+	_, err := db.Exec(ctx, ensureTopicMeta,
+		arg.Topic,
+		arg.PartitionSize,
+		arg.PartitionCount,
+		arg.FillSeqName,
+	)
+	return err
+}
+
+const getTopicMetaForUpdate = `-- name: GetTopicMetaForUpdate :one
+SELECT
+    topic, next_id, acked_id, partition_size, partition_count, fill_seq_name, lease_holder, lease_expires_at, lease_high_id, writes_since_resize, acks_since_resize, last_write_at, last_process_at, resized_at
+FROM /*tmpl*/ topic_meta /*tmpl*/
+WHERE
+    topic = $1
+FOR UPDATE
+`
+
+func (q *Queries) GetTopicMetaForUpdate(ctx context.Context, db DBTX, topic string) (*TopicMetum, error) {
+	row := db.QueryRow(ctx, getTopicMetaForUpdate, topic)
+	var i TopicMetum
+	err := row.Scan(
+		&i.Topic,
+		&i.NextID,
+		&i.AckedID,
+		&i.PartitionSize,
+		&i.PartitionCount,
+		&i.FillSeqName,
+		&i.LeaseHolder,
+		&i.LeaseExpiresAt,
+		&i.LeaseHighID,
+		&i.WritesSinceResize,
+		&i.AcksSinceResize,
+		&i.LastWriteAt,
+		&i.LastProcessAt,
+		&i.ResizedAt,
+	)
+	return &i, err
+}
+
+type InsertMessageParams struct {
+	ID      int64  `json:"id"`
+	Topic   string `json:"topic"`
+	Payload []byte `json:"payload"`
+}
+
+const listDroppablePartitions = `-- name: ListDroppablePartitions :many
+SELECT
+    topic, partition_index, relname, id_from, id_to, partition_size, high_water_id, status, created_at
+FROM /*tmpl*/ topic_partitions /*tmpl*/
+WHERE
+    topic = $1
+    AND status = 'sealed'
+    AND high_water_id > 0
+    AND high_water_id <= $2
+ORDER BY
+    partition_index ASC
+`
+
+type ListDroppablePartitionsParams struct {
+	Topic       string `json:"topic"`
+	HighWaterID int64  `json:"high_water_id"`
+}
+
+func (q *Queries) ListDroppablePartitions(ctx context.Context, db DBTX, arg ListDroppablePartitionsParams) ([]*TopicPartition, error) {
+	rows, err := db.Query(ctx, listDroppablePartitions, arg.Topic, arg.HighWaterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*TopicPartition
+	for rows.Next() {
+		var i TopicPartition
+		if err := rows.Scan(
+			&i.Topic,
+			&i.PartitionIndex,
+			&i.Relname,
+			&i.IDFrom,
+			&i.IDTo,
+			&i.PartitionSize,
+			&i.HighWaterID,
+			&i.Status,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMessagesAfterAcked = `-- name: ListMessagesAfterAcked :many
 SELECT
     id, inserted_at, topic, payload
 FROM /*tmpl*/ messages /*tmpl*/
 WHERE
     topic = $1
+    AND id > $2
+ORDER BY
+    id ASC
 LIMIT
-    COALESCE($2::integer, 100)
-FOR UPDATE SKIP LOCKED
+    COALESCE($3::integer, 100)
 `
 
-type AcquireMessagesByTopicParams struct {
+type ListMessagesAfterAckedParams struct {
 	Topic string      `json:"topic"`
+	ID    int64       `json:"id"`
 	Limit pgtype.Int4 `json:"limit"`
 }
 
-func (q *Queries) AcquireMessagesByTopic(ctx context.Context, db DBTX, arg AcquireMessagesByTopicParams) ([]*Message, error) {
-	rows, err := db.Query(ctx, acquireMessagesByTopic, arg.Topic, arg.Limit)
+func (q *Queries) ListMessagesAfterAcked(ctx context.Context, db DBTX, arg ListMessagesAfterAckedParams) ([]*Message, error) {
+	rows, err := db.Query(ctx, listMessagesAfterAcked, arg.Topic, arg.ID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -52,24 +273,230 @@ func (q *Queries) AcquireMessagesByTopic(ctx context.Context, db DBTX, arg Acqui
 	return items, nil
 }
 
-const deleteMessagesByIds = `-- name: DeleteMessagesByIds :exec
-DELETE FROM /*tmpl*/ messages /*tmpl*/
+const markTopicPartitionDropped = `-- name: MarkTopicPartitionDropped :exec
+UPDATE /*tmpl*/ topic_partitions /*tmpl*/
+SET
+    status = 'dropped'
 WHERE
     topic = $1
-    AND id = ANY($2::bigint[])
+    AND partition_index = $2
 `
 
-type DeleteMessagesByIdsParams struct {
-	Topic string  `json:"topic"`
-	Ids   []int64 `json:"ids"`
+type MarkTopicPartitionDroppedParams struct {
+	Topic          string `json:"topic"`
+	PartitionIndex int32  `json:"partition_index"`
 }
 
-func (q *Queries) DeleteMessagesByIds(ctx context.Context, db DBTX, arg DeleteMessagesByIdsParams) error {
-	_, err := db.Exec(ctx, deleteMessagesByIds, arg.Topic, arg.Ids)
+func (q *Queries) MarkTopicPartitionDropped(ctx context.Context, db DBTX, arg MarkTopicPartitionDroppedParams) error {
+	_, err := db.Exec(ctx, markTopicPartitionDropped, arg.Topic, arg.PartitionIndex)
 	return err
 }
 
-type InsertMessageParams struct {
-	Topic   string `json:"topic"`
-	Payload []byte `json:"payload"`
+const releaseTopicLease = `-- name: ReleaseTopicLease :exec
+UPDATE /*tmpl*/ topic_meta /*tmpl*/
+SET
+    lease_holder = NULL,
+    lease_expires_at = NULL,
+    lease_high_id = NULL
+WHERE
+    topic = $1
+    AND lease_holder = $2
+`
+
+type ReleaseTopicLeaseParams struct {
+	Topic       string      `json:"topic"`
+	LeaseHolder pgtype.Text `json:"lease_holder"`
+}
+
+func (q *Queries) ReleaseTopicLease(ctx context.Context, db DBTX, arg ReleaseTopicLeaseParams) error {
+	_, err := db.Exec(ctx, releaseTopicLease, arg.Topic, arg.LeaseHolder)
+	return err
+}
+
+const sealFullyAckedActivePartitions = `-- name: SealFullyAckedActivePartitions :exec
+UPDATE /*tmpl*/ topic_partitions /*tmpl*/
+SET
+    status = 'sealed'
+WHERE
+    topic = $1
+    AND status = 'active'
+    AND high_water_id > 0
+    AND high_water_id <= $2
+`
+
+type SealFullyAckedActivePartitionsParams struct {
+	Topic       string `json:"topic"`
+	HighWaterID int64  `json:"high_water_id"`
+}
+
+func (q *Queries) SealFullyAckedActivePartitions(ctx context.Context, db DBTX, arg SealFullyAckedActivePartitionsParams) error {
+	_, err := db.Exec(ctx, sealFullyAckedActivePartitions, arg.Topic, arg.HighWaterID)
+	return err
+}
+
+const sealTopicPartitionsUpTo = `-- name: SealTopicPartitionsUpTo :exec
+UPDATE /*tmpl*/ topic_partitions /*tmpl*/
+SET
+    status = 'sealed'
+WHERE
+    topic = $1
+    AND partition_index < $2
+    AND status IN ('active', 'future')
+`
+
+type SealTopicPartitionsUpToParams struct {
+	Topic          string `json:"topic"`
+	PartitionIndex int32  `json:"partition_index"`
+}
+
+func (q *Queries) SealTopicPartitionsUpTo(ctx context.Context, db DBTX, arg SealTopicPartitionsUpToParams) error {
+	_, err := db.Exec(ctx, sealTopicPartitionsUpTo, arg.Topic, arg.PartitionIndex)
+	return err
+}
+
+const setTopicLeaseHighID = `-- name: SetTopicLeaseHighID :exec
+UPDATE /*tmpl*/ topic_meta /*tmpl*/
+SET
+    lease_high_id = $2
+WHERE
+    topic = $1
+    AND lease_holder = $3
+`
+
+type SetTopicLeaseHighIDParams struct {
+	Topic       string      `json:"topic"`
+	LeaseHighID pgtype.Int8 `json:"lease_high_id"`
+	LeaseHolder pgtype.Text `json:"lease_holder"`
+}
+
+func (q *Queries) SetTopicLeaseHighID(ctx context.Context, db DBTX, arg SetTopicLeaseHighIDParams) error {
+	_, err := db.Exec(ctx, setTopicLeaseHighID, arg.Topic, arg.LeaseHighID, arg.LeaseHolder)
+	return err
+}
+
+const tryAcquireTopicLease = `-- name: TryAcquireTopicLease :one
+UPDATE /*tmpl*/ topic_meta /*tmpl*/
+SET
+    lease_holder = $1,
+    lease_expires_at = CURRENT_TIMESTAMP + INTERVAL '5 minutes',
+    lease_high_id = NULL
+WHERE
+    topic = $2
+    AND (
+        lease_holder IS NULL
+        OR lease_expires_at < CURRENT_TIMESTAMP
+        OR lease_holder = $1
+    )
+RETURNING
+    topic, next_id, acked_id, partition_size, partition_count, fill_seq_name, lease_holder, lease_expires_at, lease_high_id, writes_since_resize, acks_since_resize, last_write_at, last_process_at, resized_at
+`
+
+type TryAcquireTopicLeaseParams struct {
+	Holder pgtype.Text `json:"holder"`
+	Topic  string      `json:"topic"`
+}
+
+func (q *Queries) TryAcquireTopicLease(ctx context.Context, db DBTX, arg TryAcquireTopicLeaseParams) (*TopicMetum, error) {
+	row := db.QueryRow(ctx, tryAcquireTopicLease, arg.Holder, arg.Topic)
+	var i TopicMetum
+	err := row.Scan(
+		&i.Topic,
+		&i.NextID,
+		&i.AckedID,
+		&i.PartitionSize,
+		&i.PartitionCount,
+		&i.FillSeqName,
+		&i.LeaseHolder,
+		&i.LeaseExpiresAt,
+		&i.LeaseHighID,
+		&i.WritesSinceResize,
+		&i.AcksSinceResize,
+		&i.LastWriteAt,
+		&i.LastProcessAt,
+		&i.ResizedAt,
+	)
+	return &i, err
+}
+
+const updateTopicPartitionHighWater = `-- name: UpdateTopicPartitionHighWater :exec
+UPDATE /*tmpl*/ topic_partitions /*tmpl*/
+SET
+    high_water_id = GREATEST(high_water_id, $3),
+    status = CASE
+        WHEN status = 'future' THEN 'active'
+        ELSE status
+    END
+WHERE
+    topic = $1
+    AND partition_index = $2
+`
+
+type UpdateTopicPartitionHighWaterParams struct {
+	Topic          string `json:"topic"`
+	PartitionIndex int32  `json:"partition_index"`
+	HighWaterID    int64  `json:"high_water_id"`
+}
+
+func (q *Queries) UpdateTopicPartitionHighWater(ctx context.Context, db DBTX, arg UpdateTopicPartitionHighWaterParams) error {
+	_, err := db.Exec(ctx, updateTopicPartitionHighWater, arg.Topic, arg.PartitionIndex, arg.HighWaterID)
+	return err
+}
+
+const updateTopicSizing = `-- name: UpdateTopicSizing :exec
+UPDATE /*tmpl*/ topic_meta /*tmpl*/
+SET
+    partition_size = $2,
+    partition_count = $3,
+    writes_since_resize = 0,
+    acks_since_resize = 0,
+    resized_at = CURRENT_TIMESTAMP
+WHERE
+    topic = $1
+`
+
+type UpdateTopicSizingParams struct {
+	Topic          string `json:"topic"`
+	PartitionSize  int64  `json:"partition_size"`
+	PartitionCount int32  `json:"partition_count"`
+}
+
+func (q *Queries) UpdateTopicSizing(ctx context.Context, db DBTX, arg UpdateTopicSizingParams) error {
+	_, err := db.Exec(ctx, updateTopicSizing, arg.Topic, arg.PartitionSize, arg.PartitionCount)
+	return err
+}
+
+const upsertTopicPartition = `-- name: UpsertTopicPartition :exec
+INSERT INTO /*tmpl*/ topic_partitions /*tmpl*/ (
+    topic,
+    partition_index,
+    relname,
+    id_from,
+    id_to,
+    partition_size,
+    status
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (topic, partition_index) DO NOTHING
+`
+
+type UpsertTopicPartitionParams struct {
+	Topic          string `json:"topic"`
+	PartitionIndex int32  `json:"partition_index"`
+	Relname        string `json:"relname"`
+	IDFrom         int64  `json:"id_from"`
+	IDTo           int64  `json:"id_to"`
+	PartitionSize  int64  `json:"partition_size"`
+	Status         string `json:"status"`
+}
+
+func (q *Queries) UpsertTopicPartition(ctx context.Context, db DBTX, arg UpsertTopicPartitionParams) error {
+	_, err := db.Exec(ctx, upsertTopicPartition,
+		arg.Topic,
+		arg.PartitionIndex,
+		arg.Relname,
+		arg.IDFrom,
+		arg.IDTo,
+		arg.PartitionSize,
+		arg.Status,
+	)
+	return err
 }
