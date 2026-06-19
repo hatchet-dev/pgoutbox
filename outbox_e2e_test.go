@@ -102,6 +102,48 @@ func (c *captureFlusher) Received() []*sqlc.Message {
 	return out
 }
 
+// txCaptureFlusher is a TxFlusher that, for every message it flushes, writes a
+// row into a side table using the transaction handed to it by ProcessMessages.
+// Because that write shares the transaction that deletes the messages, the side
+// rows and the delete commit (or roll back) atomically. It can be configured to
+// fail after performing its write, to exercise the rollback path.
+type txCaptureFlusher struct {
+	mu       sync.Mutex
+	table    string // schema-qualified, already sanitized
+	received []*sqlc.Message
+	failWith error
+}
+
+func (c *txCaptureFlusher) Flush(_ context.Context, _ []*sqlc.Message) error {
+	return fmt.Errorf("Flush called but FlushWithTx was expected")
+}
+
+func (c *txCaptureFlusher) FlushWithTx(ctx context.Context, tx pgx.Tx, msgs []*sqlc.Message) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, m := range msgs {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("INSERT INTO %s (msg_id) VALUES ($1)", c.table), m.ID); err != nil {
+			return err
+		}
+	}
+
+	if c.failWith != nil {
+		return c.failWith
+	}
+
+	c.received = append(c.received, msgs...)
+	return nil
+}
+
+func (c *txCaptureFlusher) Received() []*sqlc.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*sqlc.Message, len(c.received))
+	copy(out, c.received)
+	return out
+}
+
 func countMessages(t *testing.T, ctx context.Context, schema, topic string) int {
 	t.Helper()
 
@@ -447,4 +489,105 @@ func TestOutbox_TableLandsInConfiguredSchema(t *testing.T) {
 	).Scan(&schemaName)
 	require.NoError(t, err)
 	assert.Equal(t, schema, schemaName)
+}
+
+// createSideTable creates a simple (msg_id bigint) table in the given schema
+// and returns its sanitized, schema-qualified name for use by txCaptureFlusher.
+func createSideTable(t *testing.T, ctx context.Context, schema string) string {
+	t.Helper()
+	qualified := pgx.Identifier{schema, "side_log"}.Sanitize()
+	_, err := sharedPool.Exec(ctx, fmt.Sprintf("CREATE TABLE %s (msg_id bigint NOT NULL)", qualified))
+	require.NoError(t, err)
+	return qualified
+}
+
+func countSideRows(t *testing.T, ctx context.Context, table string) int {
+	t.Helper()
+	var n int
+	err := sharedPool.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", table)).Scan(&n)
+	require.NoError(t, err)
+	return n
+}
+
+// TestOutbox_FlushWithTxCommitsAtomically verifies that a TxFlusher's writes
+// land in the same transaction as the message delete: on success, the side rows
+// exist and the messages are gone.
+func TestOutbox_FlushWithTxCommitsAtomically(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	table := createSideTable(t, ctx, schema)
+	flusher := &txCaptureFlusher{table: table}
+	outbox.AddFlusher("orders", flusher)
+
+	tx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, tx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 1})},
+		{Payload: mustPayload(t, map[string]int{"id": 2})},
+		{Payload: mustPayload(t, map[string]int{"id": 3})},
+	}))
+	require.NoError(t, tx.Commit(ctx))
+
+	processed, err := outbox.ProcessMessages(ctx, "orders")
+	require.NoError(t, err)
+	assert.Len(t, processed, 3)
+	assert.Len(t, flusher.Received(), 3)
+
+	// The flusher's writes and the message delete shared one transaction:
+	// both must have committed.
+	assert.Equal(t, 3, countSideRows(t, ctx, table), "side rows written via the shared tx should be committed")
+	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"), "flushed messages should be deleted")
+}
+
+// TestOutbox_FlushWithTxRollsBackAtomically verifies that when a TxFlusher
+// fails after writing through the shared tx, both its writes AND the message
+// delete roll back: the side table stays empty and the messages survive.
+func TestOutbox_FlushWithTxRollsBackAtomically(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	table := createSideTable(t, ctx, schema)
+	flusher := &txCaptureFlusher{table: table, failWith: fmt.Errorf("destination unavailable")}
+	outbox.AddFlusher("orders", flusher)
+
+	tx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, outbox.AddMessages(ctx, tx, "orders", []pgoutbox.MessageOpts{
+		{Payload: mustPayload(t, map[string]int{"id": 1})},
+		{Payload: mustPayload(t, map[string]int{"id": 2})},
+	}))
+	require.NoError(t, tx.Commit(ctx))
+
+	_, err = outbox.ProcessMessages(ctx, "orders")
+	require.Error(t, err)
+
+	// The whole transaction rolled back: no side rows, messages intact.
+	assert.Equal(t, 0, countSideRows(t, ctx, table), "side rows must roll back with the failed flush")
+	assert.Equal(t, 2, countMessages(t, ctx, schema, "orders"), "messages must survive a failed flush")
+
+	// Once the flusher recovers, the same messages flush and the side rows land.
+	flusher.mu.Lock()
+	flusher.failWith = nil
+	flusher.mu.Unlock()
+
+	processed, err := outbox.ProcessMessages(ctx, "orders")
+	require.NoError(t, err)
+	assert.Len(t, processed, 2)
+	assert.Equal(t, 2, countSideRows(t, ctx, table))
+	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"))
 }

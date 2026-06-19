@@ -17,6 +17,17 @@ type Flusher interface {
 	Flush(ctx context.Context, msgs []*sqlc.Message) error
 }
 
+// TxFlusher is an optional extension of Flusher. When a registered flusher
+// implements it, ProcessMessages calls FlushWithTx instead of Flush, handing
+// over the same pgx.Tx it used to acquire the messages. This lets the flusher
+// run its own writes in the same transaction that deletes the flushed
+// messages, so the flush and the delete commit (or roll back) atomically.
+type TxFlusher interface {
+	Flusher
+
+	FlushWithTx(ctx context.Context, tx pgx.Tx, msgs []*sqlc.Message) error
+}
+
 type MessageOpts struct {
 	Payload []byte
 }
@@ -203,8 +214,13 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string) ([]*sqlc
 		return nil, nil
 	}
 
-	// call the flusher
-	err = f.Flush(ctx, msgs)
+	// call the flusher. If it can operate within our transaction, hand it the
+	// tx so its writes commit atomically with the delete below.
+	if tf, ok := f.(TxFlusher); ok {
+		err = tf.FlushWithTx(ctx, tx, msgs)
+	} else {
+		err = f.Flush(ctx, msgs)
+	}
 
 	if err != nil {
 		return nil, fmt.Errorf("flusher failed for topic %q: %w", topic, err)

@@ -2,11 +2,13 @@ package pgoutbox_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 
 	"github.com/hatchet-dev/pgoutbox"
@@ -24,7 +26,51 @@ func (c *countingFlusher) Flush(_ context.Context, msgs []*sqlc.Message) error {
 	return nil
 }
 
+// txCountingFlusher is the TxFlusher analogue of countingFlusher: it writes one
+// row per message through the shared transaction (so the work is comparable to
+// a real tx-bound flush) before running the same bookkeeping callback.
+type txCountingFlusher struct {
+	table   string // schema-qualified, sanitized
+	onFlush func(n int)
+}
+
+func (c *txCountingFlusher) Flush(_ context.Context, _ []*sqlc.Message) error {
+	return fmt.Errorf("Flush called but FlushWithTx was expected")
+}
+
+func (c *txCountingFlusher) FlushWithTx(ctx context.Context, tx pgx.Tx, msgs []*sqlc.Message) error {
+	for _, m := range msgs {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("INSERT INTO %s (msg_id) VALUES ($1)", c.table), m.ID); err != nil {
+			return err
+		}
+	}
+	if c.onFlush != nil {
+		c.onFlush(len(msgs))
+	}
+	return nil
+}
+
 func BenchmarkOutbox_WriteAndPublishThroughput(b *testing.B) {
+	b.Run("Flush", func(b *testing.B) {
+		benchmarkThroughput(b, func(_ string, onFlush func(int)) pgoutbox.Flusher {
+			return &countingFlusher{onFlush: onFlush}
+		})
+	})
+	b.Run("FlushWithTx", func(b *testing.B) {
+		benchmarkThroughput(b, func(schema string, onFlush func(int)) pgoutbox.Flusher {
+			table := pgx.Identifier{schema, "bench_side_log"}.Sanitize()
+			_, err := sharedPool.Exec(context.Background(), fmt.Sprintf("CREATE TABLE %s (msg_id bigint NOT NULL)", table))
+			require.NoError(b, err)
+			return &txCountingFlusher{table: table, onFlush: onFlush}
+		})
+	})
+}
+
+// benchmarkThroughput drives a producer/consumer loop against a freshly-built
+// outbox. newFlusher builds the flusher under test from the test schema and the
+// inFlight-releasing callback, letting us reuse the harness for both the plain
+// Flush path and the FlushWithTx path.
+func benchmarkThroughput(b *testing.B, newFlusher func(schema string, onFlush func(n int)) pgoutbox.Flusher) {
 	const (
 		numWorkers  = MAX_CONNS
 		maxInFlight = 5000
@@ -49,14 +95,12 @@ func BenchmarkOutbox_WriteAndPublishThroughput(b *testing.B) {
 	inFlight := make(chan struct{}, maxInFlight)
 	var flushed atomic.Int64
 
-	outbox.AddFlusher("bench", &countingFlusher{
-		onFlush: func(n int) {
-			for range n {
-				<-inFlight
-			}
-			flushed.Add(int64(n))
-		},
-	})
+	outbox.AddFlusher("bench", newFlusher(schema, func(n int) {
+		for range n {
+			<-inFlight
+		}
+		flushed.Add(int64(n))
+	}))
 
 	procCtx, stopProcessor := context.WithCancel(ctx)
 	var procWg sync.WaitGroup
