@@ -79,6 +79,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string) error
 		db,
 		fsys,
 		goose.WithTableName(pgx.Identifier{schema, "migrations"}.Sanitize()),
+		goose.WithDisableGlobalRegistry(true),
 	)
 	if err != nil {
 		return fmt.Errorf("could not create migration provider: %w", err)
