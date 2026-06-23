@@ -73,12 +73,15 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string) error
 	}
 
 	// Instance-based provider — avoids goose's package-level globals so that
-	// concurrent migrations against different schemas don't race.
+	// we don't conflict with callers which may be using goose.
+	//
+	// Uses the search_path set in the connConfig so just using "migrations" as the table
+	// name is safe.
 	provider, err := goose.NewProvider(
 		goose.DialectPostgres,
 		db,
 		fsys,
-		goose.WithTableName(pgx.Identifier{schema, "migrations"}.Sanitize()),
+		goose.WithTableName("migrations"),
 		goose.WithDisableGlobalRegistry(true),
 	)
 	if err != nil {

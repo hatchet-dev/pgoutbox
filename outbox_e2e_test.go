@@ -457,6 +457,21 @@ func TestOutbox_ExplicitMigrate(t *testing.T) {
 	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"))
 }
 
+func TestOutbox_MigrateIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)))
+	require.True(t, messagesTableExists(t, ctx, schema))
+
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)),
+		"calling Migrate twice should be idempotent")
+}
+
 func TestOutbox_InvalidSchemaNameRejected(t *testing.T) {
 	t.Parallel()
 
