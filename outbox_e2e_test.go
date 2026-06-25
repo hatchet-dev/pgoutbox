@@ -169,7 +169,7 @@ func TestOutbox_AddAndProcessMessages(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	outbox, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	flusher := &captureFlusher{}
@@ -209,7 +209,7 @@ func TestOutbox_TopicRouting(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	outbox, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	ordersFlusher := &captureFlusher{}
@@ -248,7 +248,7 @@ func TestOutbox_RolledBackTxLeavesNoMessages(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	outbox, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	flusher := &captureFlusher{}
@@ -277,7 +277,7 @@ func TestOutbox_NoFlusherRegistered(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	outbox, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	_, err = outbox.ProcessMessages(ctx, "unregistered")
@@ -293,7 +293,7 @@ func TestOutbox_FlusherErrorLeavesMessages(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	outbox, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	flusher := &captureFlusher{failWith: fmt.Errorf("destination unavailable")}
@@ -334,6 +334,7 @@ func TestOutbox_BatchSizeIsRespected(t *testing.T) {
 	schema := uniqueSchema(t)
 
 	outbox, err := pgoutbox.NewOutbox(
+		ctx,
 		sharedPool,
 		pgoutbox.WithSchema(schema),
 		pgoutbox.WithBatchSize(1),
@@ -403,6 +404,7 @@ func TestOutbox_WithAutoMigrateFalseSkipsMigration(t *testing.T) {
 	schema := uniqueSchema(t)
 
 	_, err := pgoutbox.NewOutbox(
+		ctx,
 		sharedPool,
 		pgoutbox.WithSchema(schema),
 		pgoutbox.WithAutoMigrate(false),
@@ -427,6 +429,7 @@ func TestOutbox_ExplicitMigrate(t *testing.T) {
 	// Construct the outbox first with auto-migrate disabled — table should
 	// not exist yet.
 	outbox, err := pgoutbox.NewOutbox(
+		ctx,
 		sharedPool,
 		pgoutbox.WithSchema(schema),
 		pgoutbox.WithAutoMigrate(false),
@@ -478,6 +481,7 @@ func TestOutbox_InvalidSchemaNameRejected(t *testing.T) {
 	// Even with auto-migrate off, the constructor must reject an unsafe
 	// schema name — schema flows into SQL on every Add/Process call.
 	_, err := pgoutbox.NewOutbox(
+		context.Background(),
 		sharedPool,
 		pgoutbox.WithSchema("bad-schema; DROP SCHEMA public CASCADE; --"),
 		pgoutbox.WithAutoMigrate(false),
@@ -493,7 +497,7 @@ func TestOutbox_TableLandsInConfiguredSchema(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	_, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	_, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	var schemaName string
@@ -535,7 +539,7 @@ func TestOutbox_FlushWithTxCommitsAtomically(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	outbox, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	table := createSideTable(t, ctx, schema)
@@ -573,7 +577,7 @@ func TestOutbox_FlushWithTxRollsBackAtomically(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	outbox, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	outbox, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	table := createSideTable(t, ctx, schema)

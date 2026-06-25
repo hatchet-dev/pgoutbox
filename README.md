@@ -14,7 +14,10 @@ func (printFlusher) Flush(_ context.Context, msgs []*sqlc.Message) error {
 	return nil
 }
 
-outbox, err := pgoutbox.NewOutbox(pool)
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+outbox, err := pgoutbox.NewOutbox(ctx, pool)
 
 if err != nil {
     panic(err)
@@ -46,13 +49,13 @@ if err != nil {
 By default, `NewOutbox` runs migrations and creates an outbox table in the schema `outbox.messages`. This can be overwritten via:
 
 ```go
-outbox, err := pgoutbox.NewOutbox(pool, pgoutbox.WithSchema("my_schema"))
+outbox, err := pgoutbox.NewOutbox(ctx, pool, pgoutbox.WithSchema("my_schema"))
 ```
 
 If you'd rather run migrations yourself (for example, as part of a separate release step), disable the auto-migration and invoke `Migrate` explicitly:
 
 ```go
-outbox, err := pgoutbox.NewOutbox(pool,
+outbox, err := pgoutbox.NewOutbox(ctx, pool,
     pgoutbox.WithSchema("my_schema"),
     pgoutbox.WithAutoMigrate(false),
 )
@@ -118,7 +121,10 @@ func (f *relayFlusher) FlushWithTx(ctx context.Context, tx pgx.Tx, msgs []*sqlc.
 Call `Start` to run background maintenance goroutines that delete old messages. Expiration is configured per topic, with an optional default for topics not explicitly named:
 
 ```go
-outbox, err := pgoutbox.NewOutbox(pool,
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+outbox, err := pgoutbox.NewOutbox(ctx, pool,
     pgoutbox.WithTopicExpiration("orders", 24*time.Hour),    // orders expire after 24 h
     pgoutbox.WithTopicExpiration("events", 7*24*time.Hour),  // events expire after 7 days
     pgoutbox.WithDefaultExpiration(48*time.Hour),            // all other topics: 48 h
@@ -126,11 +132,6 @@ outbox, err := pgoutbox.NewOutbox(pool,
 if err != nil {
     panic(err)
 }
-
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-
-outbox.Start(ctx) // returns immediately; goroutines run until ctx is cancelled
 ```
 
 `Start` always runs a background scanner goroutine that polls the `topics` table, but maintenance loops are only launched for topics that actually have an expiration configured. Topics don't need to be declared at startup: the library tracks every topic that receives a message in a `topics` table (via a Postgres trigger) and applies the default expiration automatically.

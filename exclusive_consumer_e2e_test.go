@@ -20,7 +20,7 @@ func TestExclusiveConsumer_AcquireSucceeds(t *testing.T) {
 	defer cancel()
 
 	schema := uniqueSchema(t)
-	ob, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	require.NoError(t, ob.AcquireTopic(ctx, "orders"))
@@ -33,7 +33,7 @@ func TestExclusiveConsumer_AcquireBeforeMessagesExist(t *testing.T) {
 	defer cancel()
 
 	schema := uniqueSchema(t)
-	ob, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	// AcquireTopic should create the topics row even when no messages exist yet.
@@ -61,7 +61,7 @@ func TestExclusiveConsumer_RenewsInBackground(t *testing.T) {
 	defer cancel()
 
 	schema := uniqueSchema(t)
-	ob, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	ob.AddFlusher("orders", &noopFlusher{})
@@ -96,10 +96,10 @@ func TestExclusiveConsumer_BlocksUntilOtherLeaseExpires(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	obA, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
-	obB, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	ctxA, cancelA := context.WithCancel(ctx)
@@ -141,10 +141,10 @@ func TestExclusiveConsumer_ContextCancelledWhileBlocking(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	obA, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
-	obB, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	require.NoError(t, obA.AcquireTopic(ctx, "orders"))
@@ -165,7 +165,7 @@ func TestExclusiveConsumer_ProcessMessagesSucceedsWhenHoldingLease(t *testing.T)
 	defer cancel()
 
 	schema := uniqueSchema(t)
-	ob, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	ob.AddFlusher("orders", &noopFlusher{})
@@ -186,10 +186,10 @@ func TestExclusiveConsumer_ProcessMessagesFailsWhenHeldByOther(t *testing.T) {
 
 	schema := uniqueSchema(t)
 
-	obA, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
-	obB, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	obB.AddFlusher("orders", &noopFlusher{})
@@ -215,7 +215,7 @@ func TestExclusiveConsumer_ProcessMessagesFailsWithExpiredLease(t *testing.T) {
 	defer cancel()
 
 	schema := uniqueSchema(t)
-	ob, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	ob.AddFlusher("orders", &noopFlusher{})
@@ -239,7 +239,7 @@ func TestExclusiveConsumer_ProcessMessagesNonExclusiveTopicUnaffected(t *testing
 	defer cancel()
 
 	schema := uniqueSchema(t)
-	ob, err := pgoutbox.NewOutbox(sharedPool, pgoutbox.WithSchema(schema))
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
 
 	ob.AddFlusher("orders", &noopFlusher{})

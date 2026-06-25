@@ -53,13 +53,6 @@ type Outbox interface {
 	// ProcessMessages for any topic that has an active exclusive consumer.
 	AcquireTopic(ctx context.Context, topic string) error
 
-	// Start launches a background goroutine that periodically scans the topics
-	// table and spawns a per-topic maintenance goroutine for each topic that has
-	// an expiration configured (either via WithTopicExpiration or
-	// WithDefaultExpiration). All goroutines terminate when ctx is cancelled.
-	// Maintenance loops are only started for topics that have an expiration; the
-	// scanner itself always polls until ctx is cancelled.
-	Start(ctx context.Context)
 }
 
 // ErrExclusiveLeaseHeld is returned by ProcessMessages when another outbox
@@ -200,7 +193,10 @@ func WithLogger(l zerolog.Logger) OutboxOpt {
 	}
 }
 
-func NewOutbox(pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox, error) {
+// NewOutbox creates an outbox backed by pool and starts the background
+// maintenance goroutines. The goroutines run until ctx is cancelled; pass a
+// context tied to your application lifetime (e.g. from signal.NotifyContext).
+func NewOutbox(ctx context.Context, pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox, error) {
 	opts := defaultOpts()
 
 	for _, f := range fs {
@@ -224,7 +220,7 @@ func NewOutbox(pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox, error) {
 		expirations[k] = v
 	}
 
-	return &outboxImpl{
+	o := &outboxImpl{
 		queries:           queries,
 		pool:              pool,
 		schema:            opts.schema,
@@ -233,7 +229,17 @@ func NewOutbox(pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox, error) {
 		expirations:       expirations,
 		defaultExpiration: opts.defaultExpiration,
 		logger:            opts.logger,
-	}, nil
+	}
+
+	for topic, ttl := range o.expirations {
+		if err := o.ensureTopicRow(ctx, topic, ttl); err != nil {
+			o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to publish topic expiration")
+		}
+	}
+
+	go o.runTopicScanner(ctx)
+
+	return o, nil
 }
 
 func (o *outboxImpl) AddFlusher(topic string, flusher Flusher) {
@@ -485,19 +491,6 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string) ([]*sqlc
 	}
 
 	return msgs, nil
-}
-
-func (o *outboxImpl) Start(ctx context.Context) {
-	// Publish TTLs for all locally-configured topics so that any instance
-	// (including maintenance-only ones that never call AddMessages) can
-	// discover them from the topics table.
-	for topic, ttl := range o.expirations {
-		if err := o.ensureTopicRow(ctx, topic, ttl); err != nil {
-			o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to publish topic expiration")
-		}
-	}
-
-	go o.runTopicScanner(ctx)
 }
 
 // runTopicScanner polls the topics table and spawns a maintenance goroutine

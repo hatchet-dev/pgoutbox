@@ -83,6 +83,7 @@ func benchmarkThroughput(b *testing.B, newFlusher func(schema string, onFlush fu
 	schema := uniqueSchema(b)
 
 	outbox, err := pgoutbox.NewOutbox(
+		ctx,
 		sharedPool,
 		pgoutbox.WithSchema(schema),
 		pgoutbox.WithBatchSize(batchSize),
