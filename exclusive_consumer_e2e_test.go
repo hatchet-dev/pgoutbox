@@ -254,6 +254,6 @@ func TestExclusiveConsumer_ProcessMessagesNonExclusiveTopicUnaffected(t *testing
 // noopFlusher is a Flusher that does nothing and always succeeds.
 type noopFlusher struct{}
 
-func (f *noopFlusher) Flush(_ context.Context, _ []*sqlc.Message) error {
+func (f *noopFlusher) Flush(_ pgoutbox.FlushContext, _ []*sqlc.Message) error {
 	return nil
 }

@@ -19,26 +19,23 @@ type countingFlusher struct {
 	onFlush func(n int)
 }
 
-func (c *countingFlusher) Flush(_ context.Context, msgs []*sqlc.Message) error {
+func (c *countingFlusher) Flush(_ pgoutbox.FlushContext, msgs []*sqlc.Message) error {
 	if c.onFlush != nil {
 		c.onFlush(len(msgs))
 	}
 	return nil
 }
 
-// txCountingFlusher is the TxFlusher analogue of countingFlusher: it writes one
-// row per message through the shared transaction (so the work is comparable to
-// a real tx-bound flush) before running the same bookkeeping callback.
+// txCountingFlusher writes one row per message through the transaction exposed
+// by the FlushContext (so the work is comparable to a real tx-bound flush)
+// before running the same bookkeeping callback.
 type txCountingFlusher struct {
 	table   string // schema-qualified, sanitized
 	onFlush func(n int)
 }
 
-func (c *txCountingFlusher) Flush(_ context.Context, _ []*sqlc.Message) error {
-	return fmt.Errorf("Flush called but FlushWithTx was expected")
-}
-
-func (c *txCountingFlusher) FlushWithTx(ctx context.Context, tx pgx.Tx, msgs []*sqlc.Message) error {
+func (c *txCountingFlusher) Flush(ctx pgoutbox.FlushContext, msgs []*sqlc.Message) error {
+	tx := ctx.Tx()
 	for _, m := range msgs {
 		if _, err := tx.Exec(ctx, fmt.Sprintf("INSERT INTO %s (msg_id) VALUES ($1)", c.table), m.ID); err != nil {
 			return err
@@ -56,7 +53,7 @@ func BenchmarkOutbox_WriteAndPublishThroughput(b *testing.B) {
 			return &countingFlusher{onFlush: onFlush}
 		})
 	})
-	b.Run("FlushWithTx", func(b *testing.B) {
+	b.Run("TxFlush", func(b *testing.B) {
 		benchmarkThroughput(b, func(schema string, onFlush func(int)) pgoutbox.Flusher {
 			table := pgx.Identifier{schema, "bench_side_log"}.Sanitize()
 			_, err := sharedPool.Exec(context.Background(), fmt.Sprintf("CREATE TABLE %s (msg_id bigint NOT NULL)", table))
@@ -86,7 +83,6 @@ func benchmarkThroughput(b *testing.B, newFlusher func(schema string, onFlush fu
 		ctx,
 		sharedPool,
 		pgoutbox.WithSchema(schema),
-		pgoutbox.WithBatchSize(batchSize),
 	)
 	require.NoError(b, err)
 
@@ -107,7 +103,7 @@ func benchmarkThroughput(b *testing.B, newFlusher func(schema string, onFlush fu
 	var procWg sync.WaitGroup
 	procWg.Go(func() {
 		for procCtx.Err() == nil {
-			msgs, err := outbox.ProcessMessages(procCtx, "bench")
+			msgs, err := outbox.ProcessMessages(procCtx, "bench", pgoutbox.WithBatchSize(batchSize))
 			if err != nil {
 				if procCtx.Err() != nil {
 					return

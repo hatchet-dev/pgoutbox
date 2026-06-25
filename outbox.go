@@ -17,19 +17,24 @@ import (
 	"github.com/rs/zerolog"
 )
 
-type Flusher interface {
-	Flush(ctx context.Context, msgs []*sqlc.Message) error
+// FlushContext is the context passed to Flusher.Flush. It embeds
+// context.Context and exposes the transaction that ProcessMessages uses to
+// lock and delete messages. Callers that want their writes to commit
+// atomically with the outbox delete can enlist in that transaction via Tx().
+type FlushContext interface {
+	context.Context
+	Tx() pgx.Tx
 }
 
-// TxFlusher is an optional extension of Flusher. When a registered flusher
-// implements it, ProcessMessages calls FlushWithTx instead of Flush, handing
-// over the same pgx.Tx it used to acquire the messages. This lets the flusher
-// run its own writes in the same transaction that deletes the flushed
-// messages, so the flush and the delete commit (or roll back) atomically.
-type TxFlusher interface {
-	Flusher
+type flushContext struct {
+	context.Context
+	tx pgx.Tx
+}
 
-	FlushWithTx(ctx context.Context, tx pgx.Tx, msgs []*sqlc.Message) error
+func (f *flushContext) Tx() pgx.Tx { return f.tx }
+
+type Flusher interface {
+	Flush(ctx FlushContext, msgs []*sqlc.Message) error
 }
 
 type MessageOpts struct {
@@ -44,7 +49,7 @@ type Outbox interface {
 	// ProcessMessages grabs a batch of messages for the given topic, flushes them using the registered Flusher for that
 	// topic, and deletes them from the outbox if the flush is successful. If the topic has an active exclusive consumer,
 	// the calling instance must hold the exclusive lease (via AcquireTopic) or an error is returned.
-	ProcessMessages(ctx context.Context, topic string) ([]*sqlc.Message, error)
+	ProcessMessages(ctx context.Context, topic string, opts ...ProcessOpt) ([]*sqlc.Message, error)
 
 	// AcquireTopic blocks until this instance holds the exclusive processing lease
 	// for the named topic, then returns. A background goroutine automatically renews
@@ -52,7 +57,6 @@ type Outbox interface {
 	// and another instance can take over. AcquireTopic must be called before
 	// ProcessMessages for any topic that has an active exclusive consumer.
 	AcquireTopic(ctx context.Context, topic string) error
-
 }
 
 // ErrExclusiveLeaseHeld is returned by ProcessMessages when another outbox
@@ -60,8 +64,31 @@ type Outbox interface {
 var ErrExclusiveLeaseHeld = errors.New("exclusive lease held by another instance")
 
 // defaultBatchSize is the number of messages ProcessMessages will pull per
-// call when the caller has not overridden it via WithBatchSize.
-const defaultBatchSize = 100
+// call when the caller has not specified WithBatchSize.
+const defaultBatchSize = 1000
+
+// ProcessOpt is a per-call option for ProcessMessages.
+type ProcessOpt func(*processOpts)
+
+type processOpts struct {
+	batchSize int32
+}
+
+func defaultProcessOpts() *processOpts {
+	return &processOpts{batchSize: defaultBatchSize}
+}
+
+// WithBatchSize sets the maximum number of messages ProcessMessages will
+// acquire and hand to the Flusher in a single call. Must be > 0. Values
+// above math.MaxInt32 are ignored and the default (1000) is used instead.
+func WithBatchSize(n int) ProcessOpt {
+	return func(opts *processOpts) {
+		if n <= 0 || n > math.MaxInt32 {
+			return
+		}
+		opts.batchSize = int32(n)
+	}
+}
 
 // maintenanceLeaseTimeout is the age at which a held lease is considered
 // abandoned and eligible for takeover by another instance. Exposed as a var
@@ -94,7 +121,6 @@ var exclusiveLeaseRetryInterval = 1 * time.Second
 
 type outboxImplOpts struct {
 	schema            string
-	batchSize         int32
 	autoMigrate       bool
 	expirations       map[string]time.Duration
 	defaultExpiration time.Duration
@@ -104,7 +130,6 @@ type outboxImplOpts struct {
 func defaultOpts() *outboxImplOpts {
 	return &outboxImplOpts{
 		schema:      "outbox",
-		batchSize:   defaultBatchSize,
 		autoMigrate: true,
 		expirations: make(map[string]time.Duration),
 		logger:      zerolog.Nop(),
@@ -115,7 +140,6 @@ type outboxImpl struct {
 	queries    *sqlc.Queries
 	pool       *pgxpool.Pool
 	schema     string
-	batchSize  int32
 	instanceID uuid.UUID
 
 	// expirations holds the per-topic TTLs configured at construction time via
@@ -138,18 +162,6 @@ type OutboxOpt func(*outboxImplOpts)
 func WithSchema(searchPath string) OutboxOpt {
 	return func(opts *outboxImplOpts) {
 		opts.schema = searchPath
-	}
-}
-
-// WithBatchSize sets the maximum number of messages ProcessMessages will
-// acquire and hand to the Flusher per call. Must be > 0. Values are clamped
-// to int32; sizes above math.MaxInt32 fall back to the default.
-func WithBatchSize(n int) OutboxOpt {
-	return func(opts *outboxImplOpts) {
-		if n <= 0 || n > math.MaxInt32 {
-			return
-		}
-		opts.batchSize = int32(n)
 	}
 }
 
@@ -224,7 +236,6 @@ func NewOutbox(ctx context.Context, pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox
 		queries:           queries,
 		pool:              pool,
 		schema:            opts.schema,
-		batchSize:         opts.batchSize,
 		instanceID:        uuid.New(),
 		expirations:       expirations,
 		defaultExpiration: opts.defaultExpiration,
@@ -416,7 +427,7 @@ func (o *outboxImpl) checkExclusiveAccess(ctx context.Context, topic string) err
 	return fmt.Errorf("exclusive access required for topic %q: call AcquireTopic first", topic)
 }
 
-func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string) ([]*sqlc.Message, error) {
+func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string, popts ...ProcessOpt) ([]*sqlc.Message, error) {
 	f, ok := o.getFlusher(topic)
 
 	if !ok {
@@ -425,6 +436,11 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string) ([]*sqlc
 
 	if err := o.checkExclusiveAccess(ctx, topic); err != nil {
 		return nil, err
+	}
+
+	po := defaultProcessOpts()
+	for _, opt := range popts {
+		opt(po)
 	}
 
 	tx, err := o.pool.Begin(ctx)
@@ -440,7 +456,7 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string) ([]*sqlc
 	msgs, err := o.queries.AcquireMessagesByTopic(ctx, wrapped, sqlc.AcquireMessagesByTopicParams{
 		Topic: topic,
 		Limit: pgtype.Int4{
-			Int32: o.batchSize,
+			Int32: po.batchSize,
 			Valid: true,
 		},
 	})
@@ -458,13 +474,7 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string) ([]*sqlc
 		return nil, nil
 	}
 
-	// call the flusher. If it can operate within our transaction, hand it the
-	// tx so its writes commit atomically with the delete below.
-	if tf, ok := f.(TxFlusher); ok {
-		err = tf.FlushWithTx(ctx, tx, msgs)
-	} else {
-		err = f.Flush(ctx, msgs)
-	}
+	err = f.Flush(&flushContext{Context: ctx, tx: tx}, msgs)
 
 	if err != nil {
 		return nil, fmt.Errorf("flusher failed for topic %q: %w", topic, err)

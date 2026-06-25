@@ -84,7 +84,7 @@ type captureFlusher struct {
 	failWith error
 }
 
-func (c *captureFlusher) Flush(_ context.Context, msgs []*sqlc.Message) error {
+func (c *captureFlusher) Flush(_ pgoutbox.FlushContext, msgs []*sqlc.Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.failWith != nil {
@@ -102,11 +102,10 @@ func (c *captureFlusher) Received() []*sqlc.Message {
 	return out
 }
 
-// txCaptureFlusher is a TxFlusher that, for every message it flushes, writes a
-// row into a side table using the transaction handed to it by ProcessMessages.
-// Because that write shares the transaction that deletes the messages, the side
-// rows and the delete commit (or roll back) atomically. It can be configured to
-// fail after performing its write, to exercise the rollback path.
+// txCaptureFlusher writes a row into a side table for every message it flushes
+// using the transaction exposed by the FlushContext. Because that write shares
+// the transaction that deletes the outbox messages, the two commit (or roll
+// back) atomically. It can be configured to fail to exercise the rollback path.
 type txCaptureFlusher struct {
 	mu       sync.Mutex
 	table    string // schema-qualified, already sanitized
@@ -114,14 +113,11 @@ type txCaptureFlusher struct {
 	failWith error
 }
 
-func (c *txCaptureFlusher) Flush(_ context.Context, _ []*sqlc.Message) error {
-	return fmt.Errorf("Flush called but FlushWithTx was expected")
-}
-
-func (c *txCaptureFlusher) FlushWithTx(ctx context.Context, tx pgx.Tx, msgs []*sqlc.Message) error {
+func (c *txCaptureFlusher) Flush(ctx pgoutbox.FlushContext, msgs []*sqlc.Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	tx := ctx.Tx()
 	for _, m := range msgs {
 		if _, err := tx.Exec(ctx, fmt.Sprintf("INSERT INTO %s (msg_id) VALUES ($1)", c.table), m.ID); err != nil {
 			return err
@@ -337,7 +333,6 @@ func TestOutbox_BatchSizeIsRespected(t *testing.T) {
 		ctx,
 		sharedPool,
 		pgoutbox.WithSchema(schema),
-		pgoutbox.WithBatchSize(1),
 	)
 	require.NoError(t, err)
 
@@ -354,14 +349,14 @@ func TestOutbox_BatchSizeIsRespected(t *testing.T) {
 	require.NoError(t, tx.Commit(ctx))
 
 	// First call: only 1 of 3 should be flushed.
-	processed, err := outbox.ProcessMessages(ctx, "orders")
+	processed, err := outbox.ProcessMessages(ctx, "orders", pgoutbox.WithBatchSize(1))
 	require.NoError(t, err)
 	assert.Len(t, processed, 1, "ProcessMessages should return exactly batchSize messages")
 	assert.Len(t, flusher.Received(), 1)
 	assert.Equal(t, 2, countMessages(t, ctx, schema, "orders"))
 
 	// Second call: one more.
-	processed, err = outbox.ProcessMessages(ctx, "orders")
+	processed, err = outbox.ProcessMessages(ctx, "orders", pgoutbox.WithBatchSize(1))
 	require.NoError(t, err)
 	assert.Len(t, processed, 1)
 	assert.Len(t, flusher.Received(), 2)
