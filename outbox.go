@@ -53,15 +53,17 @@ type Outbox interface {
 	// ProcessMessages for any topic that has an active exclusive consumer.
 	AcquireTopic(ctx context.Context, topic string) error
 
-	// Start launches a background scanner that discovers topics with configured
-	// expirations from the topics table and runs per-topic maintenance goroutines.
-	// Goroutines terminate when ctx is cancelled. Start is a no-op when no topics
-	// with expirations exist in the database.
+	// Start launches a background goroutine that periodically scans the topics
+	// table and spawns a per-topic maintenance goroutine for each topic that has
+	// an expiration configured (either via WithTopicExpiration or
+	// WithDefaultExpiration). All goroutines terminate when ctx is cancelled.
+	// Maintenance loops are only started for topics that have an expiration; the
+	// scanner itself always polls until ctx is cancelled.
 	Start(ctx context.Context)
 }
 
-// ErrExclusiveLeaseHeld is returned by AcquireTopic when another outbox instance
-// currently holds a valid exclusive lease for the topic.
+// ErrExclusiveLeaseHeld is returned by ProcessMessages when another outbox
+// instance currently holds a valid exclusive lease for the topic.
 var ErrExclusiveLeaseHeld = errors.New("exclusive lease held by another instance")
 
 // defaultBatchSize is the number of messages ProcessMessages will pull per
@@ -168,11 +170,11 @@ func WithAutoMigrate(enabled bool) OutboxOpt {
 	}
 }
 
-// WithTopicExpiration registers a TTL for the named topic. On the first
-// AddMessages call for that topic (and on Start), the TTL is written to the
-// topics table so that any outbox instance can discover it. Messages older
-// than ttl are eligible for deletion by the background maintenance goroutine
-// launched by Start. Per-topic TTLs take precedence over WithDefaultExpiration.
+// WithTopicExpiration registers a TTL for the named topic. On Start, the TTL is
+// written to the topics table so that any outbox instance can discover it.
+// Messages older than ttl are eligible for deletion by the background maintenance
+// goroutine launched by Start. Per-topic TTLs take precedence over
+// WithDefaultExpiration.
 func WithTopicExpiration(topic string, ttl time.Duration) OutboxOpt {
 	return func(opts *outboxImplOpts) {
 		opts.expirations[topic] = ttl
@@ -285,6 +287,10 @@ func (o *outboxImpl) AddMessages(ctx context.Context, tx pgx.Tx, topic string, m
 }
 
 func (o *outboxImpl) AcquireTopic(ctx context.Context, topic string) error {
+	if topic == "" {
+		return fmt.Errorf("topic must not be empty")
+	}
+
 	for {
 		acquired, err := o.tryAcquireTopicLease(ctx, topic)
 		if err != nil {
@@ -486,7 +492,9 @@ func (o *outboxImpl) Start(ctx context.Context) {
 	// (including maintenance-only ones that never call AddMessages) can
 	// discover them from the topics table.
 	for topic, ttl := range o.expirations {
-		_ = o.ensureTopicRow(ctx, topic, ttl)
+		if err := o.ensureTopicRow(ctx, topic, ttl); err != nil {
+			o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to publish topic expiration")
+		}
 	}
 
 	go o.runTopicScanner(ctx)

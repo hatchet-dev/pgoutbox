@@ -133,7 +133,7 @@ defer cancel()
 outbox.Start(ctx) // returns immediately; goroutines run until ctx is cancelled
 ```
 
-`Start` is safe to call when no expiration is configured — it becomes a no-op. Topics don't need to be declared at startup: the library tracks every topic that receives a message in a `topics` table (via a Postgres trigger) and applies the default expiration automatically.
+`Start` always runs a background scanner goroutine that polls the `topics` table, but maintenance loops are only launched for topics that actually have an expiration configured. Topics don't need to be declared at startup: the library tracks every topic that receives a message in a `topics` table (via a Postgres trigger) and applies the default expiration automatically.
 
 Multiple outbox instances (e.g. replicas of the same service) coordinate cleanup using a per-topic maintenance lease, so only one instance runs the delete at a time.
 
