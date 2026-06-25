@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -52,6 +53,21 @@ func (q *Queries) AcquireMessagesByTopic(ctx context.Context, db DBTX, arg Acqui
 	return items, nil
 }
 
+const deleteExpiredMessages = `-- name: DeleteExpiredMessages :exec
+DELETE FROM /*tmpl*/ messages /*tmpl*/
+WHERE topic = $1 AND inserted_at < $2
+`
+
+type DeleteExpiredMessagesParams struct {
+	Topic  string             `json:"topic"`
+	Cutoff pgtype.Timestamptz `json:"cutoff"`
+}
+
+func (q *Queries) DeleteExpiredMessages(ctx context.Context, db DBTX, arg DeleteExpiredMessagesParams) error {
+	_, err := db.Exec(ctx, deleteExpiredMessages, arg.Topic, arg.Cutoff)
+	return err
+}
+
 const deleteMessagesByIds = `-- name: DeleteMessagesByIds :exec
 DELETE FROM /*tmpl*/ messages /*tmpl*/
 WHERE
@@ -69,7 +85,222 @@ func (q *Queries) DeleteMessagesByIds(ctx context.Context, db DBTX, arg DeleteMe
 	return err
 }
 
+const getAllTopics = `-- name: GetAllTopics :many
+SELECT topic, expiration_nanos, exclusive_consumer_id, exclusive_consumer_expires_at
+FROM /*tmpl*/ topics /*tmpl*/
+`
+
+func (q *Queries) GetAllTopics(ctx context.Context, db DBTX) ([]*Topic, error) {
+	rows, err := db.Query(ctx, getAllTopics)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*Topic
+	for rows.Next() {
+		var i Topic
+		if err := rows.Scan(
+			&i.Topic,
+			&i.ExpirationNanos,
+			&i.ExclusiveConsumerID,
+			&i.ExclusiveConsumerExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getOldestMessageInsertedAt = `-- name: GetOldestMessageInsertedAt :one
+SELECT inserted_at FROM /*tmpl*/ messages /*tmpl*/
+WHERE topic = $1
+ORDER BY inserted_at ASC
+LIMIT 1
+`
+
+func (q *Queries) GetOldestMessageInsertedAt(ctx context.Context, db DBTX, topic string) (pgtype.Timestamptz, error) {
+	row := db.QueryRow(ctx, getOldestMessageInsertedAt, topic)
+	var inserted_at pgtype.Timestamptz
+	err := row.Scan(&inserted_at)
+	return inserted_at, err
+}
+
+const getTopicExclusiveStatus = `-- name: GetTopicExclusiveStatus :one
+SELECT exclusive_consumer_id, exclusive_consumer_expires_at
+FROM /*tmpl*/ topics /*tmpl*/
+WHERE topic = $1
+`
+
+type GetTopicExclusiveStatusRow struct {
+	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
+	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
+}
+
+func (q *Queries) GetTopicExclusiveStatus(ctx context.Context, db DBTX, topic string) (*GetTopicExclusiveStatusRow, error) {
+	row := db.QueryRow(ctx, getTopicExclusiveStatus, topic)
+	var i GetTopicExclusiveStatusRow
+	err := row.Scan(&i.ExclusiveConsumerID, &i.ExclusiveConsumerExpiresAt)
+	return &i, err
+}
+
+const getTopicForUpdate = `-- name: GetTopicForUpdate :one
+SELECT exclusive_consumer_id, exclusive_consumer_expires_at
+FROM /*tmpl*/ topics /*tmpl*/
+WHERE topic = $1
+FOR UPDATE
+`
+
+type GetTopicForUpdateRow struct {
+	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
+	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
+}
+
+func (q *Queries) GetTopicForUpdate(ctx context.Context, db DBTX, topic string) (*GetTopicForUpdateRow, error) {
+	row := db.QueryRow(ctx, getTopicForUpdate, topic)
+	var i GetTopicForUpdateRow
+	err := row.Scan(&i.ExclusiveConsumerID, &i.ExclusiveConsumerExpiresAt)
+	return &i, err
+}
+
+const getTopicsWithExpiration = `-- name: GetTopicsWithExpiration :many
+SELECT topic, expiration_nanos, exclusive_consumer_id, exclusive_consumer_expires_at
+FROM /*tmpl*/ topics /*tmpl*/
+WHERE expiration_nanos IS NOT NULL
+`
+
+func (q *Queries) GetTopicsWithExpiration(ctx context.Context, db DBTX) ([]*Topic, error) {
+	rows, err := db.Query(ctx, getTopicsWithExpiration)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*Topic
+	for rows.Next() {
+		var i Topic
+		if err := rows.Scan(
+			&i.Topic,
+			&i.ExpirationNanos,
+			&i.ExclusiveConsumerID,
+			&i.ExclusiveConsumerExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const insertMaintenanceLeaseIfAbsent = `-- name: InsertMaintenanceLeaseIfAbsent :exec
+INSERT INTO /*tmpl*/ maintenance_leases /*tmpl*/ (topic, holder_id)
+VALUES ($1, $2)
+ON CONFLICT (topic) DO NOTHING
+`
+
+type InsertMaintenanceLeaseIfAbsentParams struct {
+	Topic    string    `json:"topic"`
+	HolderID uuid.UUID `json:"holder_id"`
+}
+
+func (q *Queries) InsertMaintenanceLeaseIfAbsent(ctx context.Context, db DBTX, arg InsertMaintenanceLeaseIfAbsentParams) error {
+	_, err := db.Exec(ctx, insertMaintenanceLeaseIfAbsent, arg.Topic, arg.HolderID)
+	return err
+}
+
 type InsertMessageParams struct {
 	Topic   string `json:"topic"`
 	Payload []byte `json:"payload"`
+}
+
+const insertTopicIfAbsent = `-- name: InsertTopicIfAbsent :exec
+INSERT INTO /*tmpl*/ topics /*tmpl*/ (topic, expiration_nanos)
+VALUES ($1, $2)
+ON CONFLICT (topic) DO UPDATE
+SET expiration_nanos = COALESCE(topics.expiration_nanos, EXCLUDED.expiration_nanos)
+`
+
+type InsertTopicIfAbsentParams struct {
+	Topic           string      `json:"topic"`
+	ExpirationNanos pgtype.Int8 `json:"expiration_nanos"`
+}
+
+func (q *Queries) InsertTopicIfAbsent(ctx context.Context, db DBTX, arg InsertTopicIfAbsentParams) error {
+	_, err := db.Exec(ctx, insertTopicIfAbsent, arg.Topic, arg.ExpirationNanos)
+	return err
+}
+
+const renewTopicExclusiveConsumer = `-- name: RenewTopicExclusiveConsumer :exec
+UPDATE /*tmpl*/ topics /*tmpl*/
+SET exclusive_consumer_expires_at = $3
+WHERE topic = $1 AND exclusive_consumer_id = $2
+`
+
+type RenewTopicExclusiveConsumerParams struct {
+	Topic                      string             `json:"topic"`
+	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
+	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
+}
+
+func (q *Queries) RenewTopicExclusiveConsumer(ctx context.Context, db DBTX, arg RenewTopicExclusiveConsumerParams) error {
+	_, err := db.Exec(ctx, renewTopicExclusiveConsumer, arg.Topic, arg.ExclusiveConsumerID, arg.ExclusiveConsumerExpiresAt)
+	return err
+}
+
+const selectMaintenanceLeaseForUpdate = `-- name: SelectMaintenanceLeaseForUpdate :one
+SELECT holder_id, acquired_at
+FROM /*tmpl*/ maintenance_leases /*tmpl*/
+WHERE topic = $1
+FOR UPDATE
+`
+
+type SelectMaintenanceLeaseForUpdateRow struct {
+	HolderID   uuid.UUID          `json:"holder_id"`
+	AcquiredAt pgtype.Timestamptz `json:"acquired_at"`
+}
+
+func (q *Queries) SelectMaintenanceLeaseForUpdate(ctx context.Context, db DBTX, topic string) (*SelectMaintenanceLeaseForUpdateRow, error) {
+	row := db.QueryRow(ctx, selectMaintenanceLeaseForUpdate, topic)
+	var i SelectMaintenanceLeaseForUpdateRow
+	err := row.Scan(&i.HolderID, &i.AcquiredAt)
+	return &i, err
+}
+
+const setTopicExclusiveConsumer = `-- name: SetTopicExclusiveConsumer :exec
+UPDATE /*tmpl*/ topics /*tmpl*/
+SET exclusive_consumer_id = $2,
+    exclusive_consumer_expires_at = $3
+WHERE topic = $1
+`
+
+type SetTopicExclusiveConsumerParams struct {
+	Topic                      string             `json:"topic"`
+	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
+	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
+}
+
+func (q *Queries) SetTopicExclusiveConsumer(ctx context.Context, db DBTX, arg SetTopicExclusiveConsumerParams) error {
+	_, err := db.Exec(ctx, setTopicExclusiveConsumer, arg.Topic, arg.ExclusiveConsumerID, arg.ExclusiveConsumerExpiresAt)
+	return err
+}
+
+const updateMaintenanceLease = `-- name: UpdateMaintenanceLease :exec
+UPDATE /*tmpl*/ maintenance_leases /*tmpl*/
+SET holder_id = $2, acquired_at = NOW()
+WHERE topic = $1
+`
+
+type UpdateMaintenanceLeaseParams struct {
+	Topic    string    `json:"topic"`
+	HolderID uuid.UUID `json:"holder_id"`
+}
+
+func (q *Queries) UpdateMaintenanceLease(ctx context.Context, db DBTX, arg UpdateMaintenanceLeaseParams) error {
+	_, err := db.Exec(ctx, updateMaintenanceLease, arg.Topic, arg.HolderID)
+	return err
 }
