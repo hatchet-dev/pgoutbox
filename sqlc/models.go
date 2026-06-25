@@ -5,12 +5,26 @@
 package sqlc
 
 import (
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+type MaintenanceLease struct {
+	Topic      string             `json:"topic"`
+	HolderID   uuid.UUID          `json:"holder_id"`
+	AcquiredAt pgtype.Timestamptz `json:"acquired_at"`
+}
 
 type Message struct {
 	ID         int64              `json:"id"`
 	InsertedAt pgtype.Timestamptz `json:"inserted_at"`
 	Topic      string             `json:"topic"`
 	Payload    []byte             `json:"payload"`
+}
+
+type Topic struct {
+	Topic                      string             `json:"topic"`
+	ExpirationNanos            pgtype.Int8        `json:"expiration_nanos"`
+	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
+	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
 }
