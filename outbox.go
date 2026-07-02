@@ -53,10 +53,19 @@ type Outbox interface {
 
 	// AcquireTopic blocks until this instance holds the exclusive processing lease
 	// for the named topic, then returns. A background goroutine automatically renews
-	// the lease until ctx is cancelled, at which point the lease expires naturally
-	// and another instance can take over. AcquireTopic must be called before
-	// ProcessMessages for any topic that has an active exclusive consumer.
+	// the lease until ctx is cancelled or ReleaseTopic is called, at which point the
+	// lease expires naturally and another instance can take over. AcquireTopic must
+	// be called before ProcessMessages for any topic that has an active exclusive
+	// consumer.
 	AcquireTopic(ctx context.Context, topic string) error
+
+	// ReleaseTopic stops renewing and immediately expires the exclusive lease
+	// this instance holds for topic, letting another instance acquire it right
+	// away instead of waiting out the lease duration. It is a no-op if this
+	// instance does not currently hold the lease. As with a naturally expired
+	// lease, a subsequent ProcessMessages call still requires an explicit
+	// AcquireTopic first.
+	ReleaseTopic(ctx context.Context, topic string) error
 }
 
 // ErrExclusiveLeaseHeld is returned by ProcessMessages when another outbox
@@ -93,11 +102,11 @@ func WithBatchSize(n int) ProcessOpt {
 // maintenanceLeaseTimeout is the age at which a held lease is considered
 // abandoned and eligible for takeover by another instance. Exposed as a var
 // so tests can shorten it without a config option.
-var maintenanceLeaseTimeout = 30 * time.Second
+var maintenanceLeaseTimeout = newAtomicDuration(30 * time.Second)
 
 // topicScanInterval controls how often the scanner goroutine polls the topics
 // table for newly registered topics. Exposed as a var for tests.
-var topicScanInterval = 30 * time.Second
+var topicScanInterval = newAtomicDuration(30 * time.Second)
 
 // maintenanceIdleInterval is how long the maintenance goroutine sleeps when
 // there are no messages at all for the topic.
@@ -109,15 +118,15 @@ const maintenanceRetryInterval = 5 * time.Second
 
 // exclusiveLeaseDuration is how long each exclusive consumer lease grant lasts.
 // The renewer refreshes the lease before this elapses.
-var exclusiveLeaseDuration = 30 * time.Second
+var exclusiveLeaseDuration = newAtomicDuration(30 * time.Second)
 
 // exclusiveLeaseRenewInterval controls how often the background goroutine
 // started by AcquireTopic renews the exclusive lease.
-var exclusiveLeaseRenewInterval = 10 * time.Second
+var exclusiveLeaseRenewInterval = newAtomicDuration(10 * time.Second)
 
 // exclusiveLeaseRetryInterval is how long AcquireTopic sleeps between attempts
 // to acquire the lease when another instance currently holds it.
-var exclusiveLeaseRetryInterval = 1 * time.Second
+var exclusiveLeaseRetryInterval = newAtomicDuration(1 * time.Second)
 
 type outboxImplOpts struct {
 	schema            string
@@ -155,6 +164,11 @@ type outboxImpl struct {
 	logger zerolog.Logger
 
 	flushers sync.Map
+
+	// exclusiveLeaseRenewer runs the background goroutine that keeps this
+	// instance's exclusive lease alive for each topic it holds. AcquireTopic
+	// starts it per topic; ReleaseTopic stops it before clearing the lease.
+	exclusiveLeaseRenewer *leaseRenewer
 }
 
 type OutboxOpt func(*outboxImplOpts)
@@ -241,6 +255,7 @@ func NewOutbox(ctx context.Context, pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox
 		defaultExpiration: opts.defaultExpiration,
 		logger:            opts.logger,
 	}
+	o.exclusiveLeaseRenewer = newLeaseRenewer(exclusiveLeaseRenewInterval.Load, o.renewExclusiveLease)
 
 	for topic, ttl := range o.expirations {
 		if err := o.ensureTopicRow(ctx, topic, ttl); err != nil {
@@ -314,15 +329,35 @@ func (o *outboxImpl) AcquireTopic(ctx context.Context, topic string) error {
 			return err
 		}
 		if acquired {
-			go o.runExclusiveLeaseRenewer(ctx, topic)
+			o.exclusiveLeaseRenewer.Start(ctx, topic)
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(exclusiveLeaseRetryInterval):
+		case <-time.After(exclusiveLeaseRetryInterval.Load()):
 		}
 	}
+}
+
+// ReleaseTopic stops this instance's lease renewer for topic and expires the
+// lease immediately in the database, so another instance can acquire it right
+// away instead of waiting out the lease duration. Like a naturally expired
+// lease, the topic still requires an explicit AcquireTopic call afterward -
+// released is not the same as never having been exclusive.
+func (o *outboxImpl) ReleaseTopic(ctx context.Context, topic string) error {
+	o.exclusiveLeaseRenewer.Stop(topic)
+
+	expiredAt := time.Now().UTC().Add(-time.Second)
+	err := o.queries.RenewTopicExclusiveConsumer(ctx, dbwrap.New(o.pool, o.schema), sqlc.RenewTopicExclusiveConsumerParams{
+		Topic:                      topic,
+		ExclusiveConsumerID:        &o.instanceID,
+		ExclusiveConsumerExpiresAt: pgtype.Timestamptz{Time: expiredAt, Valid: true},
+	})
+	if err != nil {
+		return fmt.Errorf("release exclusive lease for topic %q: %w", topic, err)
+	}
+	return nil
 }
 
 // tryAcquireTopicLease makes one attempt to claim the exclusive lease. Returns
@@ -358,7 +393,7 @@ func (o *outboxImpl) tryAcquireTopicLease(ctx context.Context, topic string) (bo
 		return false, nil
 	}
 
-	expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration)
+	expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration.Load())
 	if err := o.queries.SetTopicExclusiveConsumer(ctx, wrapped, sqlc.SetTopicExclusiveConsumerParams{
 		Topic:                      topic,
 		ExclusiveConsumerID:        &o.instanceID,
@@ -373,34 +408,34 @@ func (o *outboxImpl) tryAcquireTopicLease(ctx context.Context, topic string) (bo
 	return true, nil
 }
 
-// runExclusiveLeaseRenewer periodically extends the exclusive consumer lease for
-// topic until ctx is cancelled. When ctx is done the lease expires naturally,
-// allowing another instance to acquire the topic.
-func (o *outboxImpl) runExclusiveLeaseRenewer(ctx context.Context, topic string) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(exclusiveLeaseRenewInterval):
-		}
-
-		expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration)
-		err := o.queries.RenewTopicExclusiveConsumer(ctx, dbwrap.New(o.pool, o.schema), sqlc.RenewTopicExclusiveConsumerParams{
-			Topic:                      topic,
-			ExclusiveConsumerID:        &o.instanceID,
-			ExclusiveConsumerExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
-		})
-		if err != nil && !errors.Is(err, context.Canceled) {
-			o.logger.Error().Err(err).Str("topic", topic).Msg("exclusive consumer: failed to renew lease")
-		}
+// renewExclusiveLease extends this instance's exclusive lease for topic. It is
+// called on a fixed interval by o.exclusiveLeaseRenewer for as long as this
+// instance holds the lease; if another instance has since taken over, the
+// WHERE clause makes this a silent no-op rather than an error.
+func (o *outboxImpl) renewExclusiveLease(ctx context.Context, topic string) {
+	expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration.Load())
+	err := o.queries.RenewTopicExclusiveConsumer(ctx, dbwrap.New(o.pool, o.schema), sqlc.RenewTopicExclusiveConsumerParams{
+		Topic:                      topic,
+		ExclusiveConsumerID:        &o.instanceID,
+		ExclusiveConsumerExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		o.logger.Error().Err(err).Str("topic", topic).Msg("exclusive consumer: failed to renew lease")
 	}
 }
 
-// checkExclusiveAccess returns an error if the topic has an active exclusive
-// consumer that is not this instance. A missing topics row (topic not yet seen)
-// is treated as non-exclusive.
-func (o *outboxImpl) checkExclusiveAccess(ctx context.Context, topic string) error {
-	row, err := o.queries.GetTopicExclusiveStatus(ctx, dbwrap.New(o.pool, o.schema), topic)
+// checkExclusiveAccessForUpdate locks the topic row FOR UPDATE within the
+// caller's transaction and returns an error if another instance holds an
+// active exclusive lease. A missing topics row (topic not yet seen) is
+// treated as non-exclusive.
+//
+// The row lock is held until the caller's transaction commits or rolls back,
+// so a concurrent AcquireTopic or lease renewal for this topic blocks until
+// then instead of being able to hand the lease to another instance while this
+// transaction is still relying on the check having passed. That closes the
+// gap between validating ownership and committing the work done under it.
+func (o *outboxImpl) checkExclusiveAccessForUpdate(ctx context.Context, wrapped *dbwrap.Wrapper, topic string) error {
+	row, err := o.queries.GetTopicForUpdate(ctx, wrapped, topic)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -434,10 +469,6 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string, popts ..
 		return nil, fmt.Errorf("no flusher registered for topic %q", topic)
 	}
 
-	if err := o.checkExclusiveAccess(ctx, topic); err != nil {
-		return nil, err
-	}
-
 	po := defaultProcessOpts()
 	for _, opt := range popts {
 		opt(po)
@@ -452,6 +483,10 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string, popts ..
 	defer tx.Rollback(ctx)
 
 	wrapped := dbwrap.New(tx, o.schema)
+
+	if err := o.checkExclusiveAccessForUpdate(ctx, wrapped, topic); err != nil {
+		return nil, err
+	}
 
 	msgs, err := o.queries.AcquireMessagesByTopic(ctx, wrapped, sqlc.AcquireMessagesByTopicParams{
 		Topic: topic,
@@ -542,7 +577,7 @@ func (o *outboxImpl) runTopicScanner(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(topicScanInterval):
+		case <-time.After(topicScanInterval.Load()):
 		}
 	}
 }
@@ -631,7 +666,7 @@ func (o *outboxImpl) runMaintenance(ctx context.Context, topic string, ttl time.
 	}
 
 	holdsLease := lease.HolderID == o.instanceID
-	leaseExpired := time.Since(lease.AcquiredAt.Time) > maintenanceLeaseTimeout
+	leaseExpired := time.Since(lease.AcquiredAt.Time) > maintenanceLeaseTimeout.Load()
 
 	if !holdsLease && !leaseExpired {
 		return errLeaseHeld

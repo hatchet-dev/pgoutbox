@@ -129,24 +129,6 @@ func (q *Queries) GetOldestMessageInsertedAt(ctx context.Context, db DBTX, topic
 	return inserted_at, err
 }
 
-const getTopicExclusiveStatus = `-- name: GetTopicExclusiveStatus :one
-SELECT exclusive_consumer_id, exclusive_consumer_expires_at
-FROM /*tmpl*/ topics /*tmpl*/
-WHERE topic = $1
-`
-
-type GetTopicExclusiveStatusRow struct {
-	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
-	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
-}
-
-func (q *Queries) GetTopicExclusiveStatus(ctx context.Context, db DBTX, topic string) (*GetTopicExclusiveStatusRow, error) {
-	row := db.QueryRow(ctx, getTopicExclusiveStatus, topic)
-	var i GetTopicExclusiveStatusRow
-	err := row.Scan(&i.ExclusiveConsumerID, &i.ExclusiveConsumerExpiresAt)
-	return &i, err
-}
-
 const getTopicForUpdate = `-- name: GetTopicForUpdate :one
 SELECT exclusive_consumer_id, exclusive_consumer_expires_at
 FROM /*tmpl*/ topics /*tmpl*/
