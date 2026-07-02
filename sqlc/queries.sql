@@ -61,11 +61,6 @@ WHERE expiration_nanos IS NOT NULL;
 SELECT topic, expiration_nanos, exclusive_consumer_id, exclusive_consumer_expires_at
 FROM /*tmpl*/ topics /*tmpl*/;
 
--- name: GetTopicExclusiveStatus :one
-SELECT exclusive_consumer_id, exclusive_consumer_expires_at
-FROM /*tmpl*/ topics /*tmpl*/
-WHERE topic = $1;
-
 -- name: GetTopicForUpdate :one
 SELECT exclusive_consumer_id, exclusive_consumer_expires_at
 FROM /*tmpl*/ topics /*tmpl*/
