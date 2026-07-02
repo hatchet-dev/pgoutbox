@@ -279,6 +279,20 @@ func TestExclusiveConsumer_ReleaseTopicAllowsImmediateReacquire(t *testing.T) {
 	require.NoError(t, obB.AcquireTopic(acquireCtx, "orders"))
 }
 
+func TestExclusiveConsumer_ReleaseTopicRejectsEmptyTopic(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	err = ob.ReleaseTopic(ctx, "")
+	require.Error(t, err, "ReleaseTopic must validate topic the same way AcquireTopic does")
+}
+
 func TestExclusiveConsumer_ReleaseTopicNoOpWhenNotHeld(t *testing.T) {
 	t.Parallel()
 

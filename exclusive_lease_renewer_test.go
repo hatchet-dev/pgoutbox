@@ -158,6 +158,46 @@ func TestLeaseRenewer_ExternalContextCancelStopsRenewer(t *testing.T) {
 	}
 }
 
+// TestLeaseRenewer_ExternalContextCancelCleansUpRunningMap guards against a
+// leak: if a topic's ctx is cancelled externally (not via Stop), the running
+// goroutine must remove its own entry from r.running once it exits, so
+// running reflects "currently running" rather than "ever started" and Stop
+// (or a later Start) doesn't have to be called just to reclaim the memory.
+func TestLeaseRenewer_ExternalContextCancelCleansUpRunningMap(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	r := newLeaseRenewer(func() time.Duration { return 5 * time.Millisecond }, func(context.Context, string) {
+		calls.Add(1)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx, "orders")
+
+	deadline := time.After(2 * time.Second)
+	for calls.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for the first renew call")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+
+	deadline = time.After(2 * time.Second)
+	for {
+		if _, ok := r.running.Load("orders"); !ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for the running-map entry to be cleaned up after external cancellation")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 func TestLeaseRenewer_TopicsAreIndependent(t *testing.T) {
 	t.Parallel()
 

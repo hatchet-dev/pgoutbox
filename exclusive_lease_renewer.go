@@ -47,10 +47,21 @@ func (r *leaseRenewer) Start(ctx context.Context, topic string) {
 
 	renewCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	r.running.Store(topic, &leaseRenewerHandle{cancel: cancel, done: done})
+	handle := &leaseRenewerHandle{cancel: cancel, done: done}
+	r.running.Store(topic, handle)
 
 	go func() {
+		// Registered before the CompareAndDelete defer below so it runs after
+		// it (defers run LIFO): any waiter unblocked by close(done) is
+		// guaranteed to observe the map already cleaned up.
 		defer close(done)
+		// Runs after r.run returns for any reason, including the ctx passed to
+		// Start being cancelled externally rather than via Stop. Without this,
+		// running would keep a stale entry for a renewer that already exited,
+		// tracking "ever started" instead of "currently running". Guarded by
+		// identity so it never removes a different handle a later Start/Stop
+		// may have already installed for the same topic.
+		defer r.running.CompareAndDelete(topic, handle)
 		r.run(renewCtx, topic)
 	}()
 }

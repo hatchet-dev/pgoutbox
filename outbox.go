@@ -346,6 +346,10 @@ func (o *outboxImpl) AcquireTopic(ctx context.Context, topic string) error {
 // lease, the topic still requires an explicit AcquireTopic call afterward -
 // released is not the same as never having been exclusive.
 func (o *outboxImpl) ReleaseTopic(ctx context.Context, topic string) error {
+	if topic == "" {
+		return fmt.Errorf("topic must not be empty")
+	}
+
 	o.exclusiveLeaseRenewer.Stop(topic)
 
 	expiredAt := time.Now().UTC().Add(-time.Second)
