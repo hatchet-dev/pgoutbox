@@ -3,9 +3,11 @@ package pgoutbox_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -370,9 +372,10 @@ func (f *blockingFlusher) Flush(_ pgoutbox.FlushContext, _ []*sqlc.Message) erro
 func TestExclusiveConsumer_ProcessMessagesBlocksHandoffUntilTransactionEnds(t *testing.T) {
 	// No t.Parallel() — modifies global timing vars shared with other tests.
 
-	// Short lease so it would have expired by timestamp alone while A is
-	// stalled; renewal disabled so nothing keeps it alive artificially.
-	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(100 * time.Millisecond)
+	// Short lease so A's hold would have expired by timestamp alone while A is
+	// stalled; the session heartbeat is disabled so nothing keeps it alive
+	// artificially (simulating a hung instance whose heartbeats have stopped).
+	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(200 * time.Millisecond)
 	defer restoreDuration()
 	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(10 * time.Minute)
 	defer restoreRenew()
@@ -412,10 +415,10 @@ func TestExclusiveConsumer_ProcessMessagesBlocksHandoffUntilTransactionEnds(t *t
 		t.Fatal("timed out waiting for A to enter Flush")
 	}
 
-	// A's lease is not being renewed, so by timestamp alone it has expired.
-	// B tries to acquire in the background; it must not succeed while A's
-	// transaction (and thus its row lock) is still open.
-	time.Sleep(150 * time.Millisecond)
+	// A's consumer session is not being renewed, so by timestamp alone its
+	// lease has expired. B tries to acquire in the background; it must not
+	// succeed while A's transaction (and thus its row lock) is still open.
+	time.Sleep(250 * time.Millisecond)
 
 	acquiredB := make(chan error, 1)
 	go func() { acquiredB <- obB.AcquireTopic(ctx, "orders") }()
@@ -448,7 +451,168 @@ func TestExclusiveConsumer_ProcessMessagesBlocksHandoffUntilTransactionEnds(t *t
 
 	// The messages were already processed and deleted by A while it
 	// legitimately held the lease; B, now the new owner, sees none left.
-	msgsForB, err := obB.ProcessMessages(ctx, "orders")
+	// (B's own consumer session is just as stale as A's under the disabled
+	// heartbeat, so assert via SQL rather than a ProcessMessages call.)
+	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"))
+}
+
+// TestExclusiveConsumer_ManyTopicsBoundedSessionWrites is the regression test
+// for the scaling problem session leases exist to fix: holding N topics must
+// not cost N periodic writes to the topics table. It proves the topics rows
+// are never touched after acquisition (via their xmin system column, which
+// any UPDATE would change — even one writing identical values) while the
+// single consumer-session row keeps being renewed.
+func TestExclusiveConsumer_ManyTopicsBoundedSessionWrites(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(50 * time.Millisecond)
+	defer restoreRenew()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
 	require.NoError(t, err)
-	assert.Empty(t, msgsForB)
+
+	const numTopics = 500
+	for i := range numTopics {
+		require.NoError(t, ob.AcquireTopic(ctx, fmt.Sprintf("orders-%d", i)))
+	}
+
+	// One instance, one session row — however many topics it holds.
+	var sessionCount int
+	require.NoError(t, sharedPool.QueryRow(ctx,
+		fmt.Sprintf("SELECT count(*) FROM %s.consumer_sessions", schema)).Scan(&sessionCount))
+	assert.Equal(t, 1, sessionCount)
+
+	// Every held topic defers to the session: no per-topic timestamps.
+	var overrideCount int
+	require.NoError(t, sharedPool.QueryRow(ctx,
+		fmt.Sprintf("SELECT count(*) FROM %s.topics WHERE exclusive_consumer_expires_at IS NOT NULL", schema)).Scan(&overrideCount))
+	assert.Equal(t, 0, overrideCount)
+
+	snapshotTopicRowVersions := func() map[string]string {
+		rows, err := sharedPool.Query(ctx, fmt.Sprintf("SELECT topic, xmin::text FROM %s.topics", schema))
+		require.NoError(t, err)
+		defer rows.Close()
+		versions := make(map[string]string, numTopics)
+		for rows.Next() {
+			var topic, xmin string
+			require.NoError(t, rows.Scan(&topic, &xmin))
+			versions[topic] = xmin
+		}
+		require.NoError(t, rows.Err())
+		require.Len(t, versions, numTopics)
+		return versions
+	}
+
+	var sessionExpiresBefore time.Time
+	require.NoError(t, sharedPool.QueryRow(ctx,
+		fmt.Sprintf("SELECT expires_at FROM %s.consumer_sessions", schema)).Scan(&sessionExpiresBefore))
+	before := snapshotTopicRowVersions()
+
+	// Sleep across several renewal intervals.
+	time.Sleep(300 * time.Millisecond)
+
+	// Zero writes landed on any topics row...
+	assert.Equal(t, before, snapshotTopicRowVersions(), "topics rows were written during steady-state hold")
+
+	// ...while the centralized session heartbeat kept advancing.
+	var sessionExpiresAfter time.Time
+	require.NoError(t, sharedPool.QueryRow(ctx,
+		fmt.Sprintf("SELECT expires_at FROM %s.consumer_sessions", schema)).Scan(&sessionExpiresAfter))
+	assert.True(t, sessionExpiresAfter.After(sessionExpiresBefore),
+		"consumer session expires_at did not advance: before=%v after=%v", sessionExpiresBefore, sessionExpiresAfter)
+}
+
+// TestExclusiveConsumer_ReacquireBeforeOldWatcherFiresDoesNotReintroduceReleaseOverride
+// covers the reacquire race (design Finding 2): cancelling an AcquireTopic
+// ctx and immediately re-acquiring the same topic on the same instance must
+// not let the old hold's grace-period override land after the fresh acquire,
+// where it would silently expire a valid session-deferred lease.
+func TestExclusiveConsumer_ReacquireBeforeOldWatcherFiresDoesNotReintroduceReleaseOverride(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	// Lease duration short enough that a stray grace override (now + duration)
+	// would lapse mid-test and break ProcessMessages; renewal interval short
+	// enough to keep the consumer session fresh despite that short duration.
+	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(150 * time.Millisecond)
+	defer restoreDuration()
+	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(25 * time.Millisecond)
+	defer restoreRenew()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	ob.AddFlusher("orders", &noopFlusher{})
+
+	acquireCtx, cancelAcquire := context.WithCancel(ctx)
+	require.NoError(t, ob.AcquireTopic(acquireCtx, "orders"))
+
+	// Cancel the first hold and immediately re-acquire on the same instance.
+	cancelAcquire()
+	require.NoError(t, ob.AcquireTopic(ctx, "orders"))
+
+	// ProcessMessages must keep succeeding well past the point where a stray
+	// grace override from the first hold would have expired the lease.
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, err := ob.ProcessMessages(ctx, "orders")
+		require.NoError(t, err, "lease lapsed after reacquire — old watcher's override must not survive")
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	var expiresAt *time.Time
+	require.NoError(t, sharedPool.QueryRow(ctx,
+		fmt.Sprintf("SELECT exclusive_consumer_expires_at FROM %s.topics WHERE topic = 'orders'", schema)).Scan(&expiresAt))
+	assert.Nil(t, expiresAt, "reacquired topic must defer to the consumer session, not carry an override")
+}
+
+// TestExclusiveConsumer_HonorsLegacyPerTopicTimestampLease covers the rolling
+// upgrade path: an instance running a pre-session version of pgoutbox writes
+// its lease as a per-topic exclusive_consumer_expires_at timestamp and has no
+// consumer_sessions row. Simulated here with direct SQL, since that lease
+// shape can no longer be produced through the API. A session-aware instance
+// must honor the legacy lease (the non-NULL timestamp wins the COALESCE over
+// the missing session) until it lapses, then take over normally.
+func TestExclusiveConsumer_HonorsLegacyPerTopicTimestampLease(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	restoreRetry := pgoutbox.SetExclusiveLeaseRetryIntervalForTest(20 * time.Millisecond)
+	defer restoreRetry()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	ob.AddFlusher("orders", &noopFlusher{})
+	insertMessages(t, ctx, ob, "orders", 2)
+
+	legacyHolderID := uuid.New()
+	_, err = sharedPool.Exec(ctx, fmt.Sprintf(
+		"UPDATE %s.topics SET exclusive_consumer_id = $1, exclusive_consumer_expires_at = now() + interval '500 milliseconds' WHERE topic = 'orders'",
+		schema), legacyHolderID)
+	require.NoError(t, err)
+
+	// While the legacy lease is valid, the session-aware instance is locked out.
+	_, err = ob.ProcessMessages(ctx, "orders")
+	require.ErrorIs(t, err, pgoutbox.ErrExclusiveLeaseHeld)
+
+	// Once the legacy timestamp lapses it can take over, exactly as it would
+	// have against a pre-session holder that stopped renewing.
+	acquireCtx, acquireCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer acquireCancel()
+	require.NoError(t, ob.AcquireTopic(acquireCtx, "orders"))
+
+	msgs, err := ob.ProcessMessages(ctx, "orders")
+	require.NoError(t, err)
+	assert.Len(t, msgs, 2)
 }

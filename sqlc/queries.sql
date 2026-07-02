@@ -62,10 +62,18 @@ SELECT topic, expiration_nanos, exclusive_consumer_id, exclusive_consumer_expire
 FROM /*tmpl*/ topics /*tmpl*/;
 
 -- name: GetTopicForUpdate :one
-SELECT exclusive_consumer_id, exclusive_consumer_expires_at
-FROM /*tmpl*/ topics /*tmpl*/
-WHERE topic = $1
-FOR UPDATE;
+-- A NULL exclusive_consumer_expires_at on the topics row means "defer to the
+-- holder's consumer session for liveness"; a non-NULL value is a per-topic
+-- override (release, grace-period expiry, or a lease written by a pre-session
+-- version of pgoutbox) and wins the COALESCE. FOR UPDATE OF t locks only the
+-- topics row, not the joined session row shared by every topic the holder owns.
+SELECT
+    t.exclusive_consumer_id,
+    COALESCE(t.exclusive_consumer_expires_at, s.expires_at) AS exclusive_consumer_expires_at
+FROM /*tmpl*/ topics /*tmpl*/ t
+LEFT JOIN /*tmpl*/ consumer_sessions /*tmpl*/ s ON s.consumer_id = t.exclusive_consumer_id
+WHERE t.topic = $1
+FOR UPDATE OF t;
 
 -- name: SetTopicExclusiveConsumer :exec
 UPDATE /*tmpl*/ topics /*tmpl*/
@@ -77,3 +85,9 @@ WHERE topic = $1;
 UPDATE /*tmpl*/ topics /*tmpl*/
 SET exclusive_consumer_expires_at = $3
 WHERE topic = $1 AND exclusive_consumer_id = $2;
+
+-- name: UpsertConsumerSession :exec
+INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at)
+VALUES ($1, $2)
+ON CONFLICT (consumer_id) DO UPDATE
+SET expires_at = EXCLUDED.expires_at;

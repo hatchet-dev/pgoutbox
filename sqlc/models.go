@@ -9,6 +9,11 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type ConsumerSession struct {
+	ConsumerID uuid.UUID          `json:"consumer_id"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+}
+
 type MaintenanceLease struct {
 	Topic      string             `json:"topic"`
 	HolderID   uuid.UUID          `json:"holder_id"`

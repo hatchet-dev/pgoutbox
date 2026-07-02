@@ -130,10 +130,13 @@ func (q *Queries) GetOldestMessageInsertedAt(ctx context.Context, db DBTX, topic
 }
 
 const getTopicForUpdate = `-- name: GetTopicForUpdate :one
-SELECT exclusive_consumer_id, exclusive_consumer_expires_at
-FROM /*tmpl*/ topics /*tmpl*/
-WHERE topic = $1
-FOR UPDATE
+SELECT
+    t.exclusive_consumer_id,
+    COALESCE(t.exclusive_consumer_expires_at, s.expires_at) AS exclusive_consumer_expires_at
+FROM /*tmpl*/ topics /*tmpl*/ t
+LEFT JOIN /*tmpl*/ consumer_sessions /*tmpl*/ s ON s.consumer_id = t.exclusive_consumer_id
+WHERE t.topic = $1
+FOR UPDATE OF t
 `
 
 type GetTopicForUpdateRow struct {
@@ -141,6 +144,11 @@ type GetTopicForUpdateRow struct {
 	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
 }
 
+// A NULL exclusive_consumer_expires_at on the topics row means "defer to the
+// holder's consumer session for liveness"; a non-NULL value is a per-topic
+// override (release, grace-period expiry, or a lease written by a pre-session
+// version of pgoutbox) and wins the COALESCE. FOR UPDATE OF t locks only the
+// topics row, not the joined session row shared by every topic the holder owns.
 func (q *Queries) GetTopicForUpdate(ctx context.Context, db DBTX, topic string) (*GetTopicForUpdateRow, error) {
 	row := db.QueryRow(ctx, getTopicForUpdate, topic)
 	var i GetTopicForUpdateRow
@@ -284,5 +292,22 @@ type UpdateMaintenanceLeaseParams struct {
 
 func (q *Queries) UpdateMaintenanceLease(ctx context.Context, db DBTX, arg UpdateMaintenanceLeaseParams) error {
 	_, err := db.Exec(ctx, updateMaintenanceLease, arg.Topic, arg.HolderID)
+	return err
+}
+
+const upsertConsumerSession = `-- name: UpsertConsumerSession :exec
+INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at)
+VALUES ($1, $2)
+ON CONFLICT (consumer_id) DO UPDATE
+SET expires_at = EXCLUDED.expires_at
+`
+
+type UpsertConsumerSessionParams struct {
+	ConsumerID uuid.UUID          `json:"consumer_id"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+}
+
+func (q *Queries) UpsertConsumerSession(ctx context.Context, db DBTX, arg UpsertConsumerSessionParams) error {
+	_, err := db.Exec(ctx, upsertConsumerSession, arg.ConsumerID, arg.ExpiresAt)
 	return err
 }
