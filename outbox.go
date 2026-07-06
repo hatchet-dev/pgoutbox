@@ -136,6 +136,14 @@ var maintenanceActivitySlack = newAtomicDuration(2 * time.Minute)
 // var for tests.
 var maintenanceCatchupInterval = newAtomicDuration(time.Hour)
 
+// consumerSessionRetention is how long an expired consumer-session row is
+// kept before the catch-up sweep garbage-collects it. Instance ids are
+// per-NewOutbox, so every process restart strands one row; sweeping them
+// keeps the table at O(live instances). Deletion is semantically the same as
+// expiry, so the buffer is caution against clock skew, not correctness.
+// Exposed as a var for tests.
+var consumerSessionRetention = newAtomicDuration(time.Hour)
+
 // exclusiveLeaseDuration is how far ahead each consumer-session heartbeat
 // pushes the session's expiry, and the length of the grace period granted
 // when a holder's AcquireTopic ctx is cancelled. An instance that stops
@@ -295,9 +303,9 @@ func NewOutbox(ctx context.Context, pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox
 	}
 
 	// Lenient like ensureTopicRow: with WithAutoMigrate(false) the tables may
-	// not exist yet. Until the first successful upsert (retried every renewal
-	// interval by the renewer below), this instance's exclusive leases read
-	// as expired.
+	// not exist yet. The renewer below retries every renewal interval, and
+	// AcquireTopic refreshes the session transactionally itself, so a failure
+	// here only delays maintenance fair-share accounting.
 	if err := o.upsertConsumerSession(ctx); err != nil {
 		o.logger.Error().Err(err).Msg("exclusive consumer: failed to register consumer session")
 	}
@@ -366,8 +374,10 @@ func (o *outboxImpl) AcquireTopic(ctx context.Context, topic string) error {
 	// A watcher left over from an earlier AcquireTopic for this topic must be
 	// fully stopped before re-acquiring: its one action is writing an
 	// expiring override, which would poison the fresh session-deferred lease
-	// if it landed after the acquire below. Stop blocks until any in-flight
-	// write has finished, so the acquire always has the last word.
+	// if it landed after the acquire below. Stop suppresses that write when
+	// it wins the race, and when it loses (the old ctx ended first) it blocks
+	// until the in-flight write has finished — either way the acquire always
+	// has the last word.
 	o.exclusiveLeaseWatcher.Stop(topic)
 
 	for {
@@ -444,6 +454,16 @@ func (o *outboxImpl) tryAcquireTopicLease(ctx context.Context, topic string) (bo
 		return false, nil
 	}
 
+	// Refresh our consumer session in the same transaction: the lease written
+	// below is only as alive as that session, and the background heartbeat may
+	// not have landed yet (NewOutbox's initial upsert is best-effort — tables
+	// missing under WithAutoMigrate(false), transient DB error). Failing the
+	// acquire here beats returning success for a lease that immediately reads
+	// as expired.
+	if err := o.upsertConsumerSessionIn(ctx, wrapped); err != nil {
+		return false, fmt.Errorf("refresh consumer session while acquiring topic %q: %w", topic, err)
+	}
+
 	// The per-topic timestamp is left NULL, so the lease defers to this
 	// instance's consumer session for liveness (and any stale override from a
 	// previous holder is cleared).
@@ -479,11 +499,15 @@ func (o *outboxImpl) expireExclusiveLeaseAfterGrace(ctx context.Context, topic s
 }
 
 // upsertConsumerSession registers or refreshes this instance's row in
-// consumer_sessions, the single per-instance heartbeat that
-// session-lease-mode topics defer to for liveness.
+// consumer_sessions, the single per-instance heartbeat that exclusive and
+// maintenance leases defer to for liveness.
 func (o *outboxImpl) upsertConsumerSession(ctx context.Context) error {
+	return o.upsertConsumerSessionIn(ctx, dbwrap.New(o.pool, o.schema))
+}
+
+func (o *outboxImpl) upsertConsumerSessionIn(ctx context.Context, wrapped *dbwrap.Wrapper) error {
 	expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration.Load())
-	return o.queries.UpsertConsumerSession(ctx, dbwrap.New(o.pool, o.schema), sqlc.UpsertConsumerSessionParams{
+	return o.queries.UpsertConsumerSession(ctx, wrapped, sqlc.UpsertConsumerSessionParams{
 		ConsumerID: o.instanceID,
 		ExpiresAt:  pgtype.Timestamptz{Time: expiresAt, Valid: true},
 	})
@@ -613,6 +637,18 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string, popts ..
 		return nil, fmt.Errorf("could not delete messages for topic %q: %w", topic, err)
 	}
 
+	// This transaction holds the topic row lock (checkExclusiveAccessForUpdate)
+	// for its whole lifetime, which makes the insert trigger's SKIP LOCKED
+	// activity bump skip this topic — on a continuously-processed topic the
+	// trigger could be starved out of every bump and the topic would read as
+	// dormant despite live traffic. Since we just processed messages and
+	// already hold the lock that causes the starvation, refresh the activity
+	// stamp here; the query self-gates to the trigger's 30s granularity, so
+	// this is at most one extra row write per topic per window.
+	if err := o.queries.BumpTopicActivityIfStale(ctx, wrapped, topic); err != nil {
+		return nil, fmt.Errorf("could not bump activity for topic %q: %w", topic, err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("could not commit transaction for processing messages for topic %q: %w", topic, err)
 	}
@@ -679,6 +715,15 @@ func (o *outboxImpl) scanTopics(ctx context.Context, lastCatchup time.Time) time
 		} else {
 			include = topics
 			lastCatchup = time.Now()
+		}
+
+		// Best-effort GC of session rows stranded by dead instances, on the
+		// same cadence. Every instance runs it; the guarded DELETE makes the
+		// overlap harmless.
+		cutoff := time.Now().UTC().Add(-consumerSessionRetention.Load())
+		if err := o.queries.DeleteExpiredConsumerSessions(ctx, wrapped,
+			pgtype.Timestamptz{Time: cutoff, Valid: true}); err != nil && !errors.Is(err, context.Canceled) {
+			o.logger.Error().Err(err).Msg("maintenance: failed to delete expired consumer sessions")
 		}
 	}
 

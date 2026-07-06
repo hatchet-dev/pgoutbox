@@ -573,6 +573,37 @@ func TestExclusiveConsumer_ReacquireBeforeOldWatcherFiresDoesNotReintroduceRelea
 	assert.Nil(t, expiresAt, "reacquired topic must defer to the consumer session, not carry an override")
 }
 
+// TestExclusiveConsumer_AcquireRestoresMissingConsumerSession: an acquired
+// lease is only as alive as this instance's consumer session, so AcquireTopic
+// refreshes the session inside the acquire transaction rather than trusting
+// that the background heartbeat has landed (the NewOutbox upsert is
+// best-effort and only retries on an interval).
+func TestExclusiveConsumer_AcquireRestoresMissingConsumerSession(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	ob.AddFlusher("orders", &noopFlusher{})
+	insertMessages(t, ctx, ob, "orders", 2)
+
+	// Simulate the initial heartbeat never having landed.
+	_, err = sharedPool.Exec(ctx, fmt.Sprintf("DELETE FROM %s.consumer_sessions", schema))
+	require.NoError(t, err)
+
+	require.NoError(t, ob.AcquireTopic(ctx, "orders"))
+
+	// The acquire itself restored the session: the lease must read as valid
+	// immediately, not only after the next heartbeat tick.
+	msgs, err := ob.ProcessMessages(ctx, "orders")
+	require.NoError(t, err)
+	assert.Len(t, msgs, 2)
+}
+
 // TestExclusiveConsumer_HonorsLegacyPerTopicTimestampLease covers the rolling
 // upgrade path: an instance running a pre-session version of pgoutbox writes
 // its lease as a per-topic exclusive_consumer_expires_at timestamp and has no

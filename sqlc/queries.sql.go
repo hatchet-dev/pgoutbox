@@ -53,13 +53,35 @@ func (q *Queries) AcquireMessagesByTopic(ctx context.Context, db DBTX, arg Acqui
 	return items, nil
 }
 
+const bumpTopicActivityIfStale = `-- name: BumpTopicActivityIfStale :exec
+UPDATE /*tmpl*/ topics /*tmpl*/
+SET last_inserted_at = now()
+WHERE topic = $1
+  AND (last_inserted_at IS NULL OR last_inserted_at < now() - interval '30 seconds')
+`
+
+// Flush-path counterpart of the insert trigger's activity bump. The trigger
+// bumps with FOR UPDATE SKIP LOCKED, and ProcessMessages holds the topic row
+// lock for its whole transaction — so on a continuously-processed topic the
+// trigger can be starved out of every bump. The flush transaction already
+// holds that lock, so it compensates by bumping here after processing
+// messages, gated to the same 30-second granularity as the trigger.
+func (q *Queries) BumpTopicActivityIfStale(ctx context.Context, db DBTX, topic string) error {
+	_, err := db.Exec(ctx, bumpTopicActivityIfStale, topic)
+	return err
+}
+
 const claimMaintenanceLeases = `-- name: ClaimMaintenanceLeases :many
-WITH claimable AS (
+WITH sessions AS MATERIALIZED (
+    SELECT consumer_id, (expires_at < now())::boolean AS expired
+    FROM /*tmpl*/ consumer_sessions /*tmpl*/
+),
+claimable AS (
     SELECT l.topic
     FROM /*tmpl*/ maintenance_leases /*tmpl*/ l
-    LEFT JOIN /*tmpl*/ consumer_sessions /*tmpl*/ s ON s.consumer_id = l.holder_id
+    LEFT JOIN sessions s ON s.consumer_id = l.holder_id
     WHERE l.topic = ANY($2::text[])
-      AND COALESCE(s.expires_at < now(), l.acquired_at < $3::timestamptz)
+      AND COALESCE(s.expired, l.acquired_at < $3::timestamptz)
     FOR UPDATE OF l SKIP LOCKED
 )
 UPDATE /*tmpl*/ maintenance_leases /*tmpl*/ l
@@ -78,7 +100,10 @@ type ClaimMaintenanceLeasesParams struct {
 // Takeover path for lease rows whose holder is gone: its session lapsed, or
 // (pre-session holder) its acquired_at went stale. SKIP LOCKED lets racing
 // claimants skip contested rows instead of queueing; the loser claims other
-// topics on its next scan.
+// topics on its next scan. consumer_sessions (the small side, kept small by
+// the retention sweep) is narrowed once into a MATERIALIZED CTE so the
+// planner hashes it instead of choosing its own join shape against
+// maintenance_leases.
 func (q *Queries) ClaimMaintenanceLeases(ctx context.Context, db DBTX, arg ClaimMaintenanceLeasesParams) ([]string, error) {
 	rows, err := db.Query(ctx, claimMaintenanceLeases, arg.HolderID, arg.Topics, arg.StaleCutoff)
 	if err != nil {
@@ -110,6 +135,22 @@ func (q *Queries) CountLiveConsumerSessions(ctx context.Context, db DBTX) (int64
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const deleteExpiredConsumerSessions = `-- name: DeleteExpiredConsumerSessions :exec
+DELETE FROM /*tmpl*/ consumer_sessions /*tmpl*/
+WHERE expires_at < $1::timestamptz
+`
+
+// GC for session rows left behind by dead instances (one per process
+// lifetime, since instance ids are per-NewOutbox). Bounding the table keeps
+// CountLiveConsumerSessions and the lease-liveness joins on a small seq scan.
+// Deleting a row is equivalent to it being expired, so the cutoff buffer is
+// caution, not correctness; a live instance wrongly swept just re-inserts
+// itself on its next heartbeat.
+func (q *Queries) DeleteExpiredConsumerSessions(ctx context.Context, db DBTX, cutoff pgtype.Timestamptz) error {
+	_, err := db.Exec(ctx, deleteExpiredConsumerSessions, cutoff)
+	return err
 }
 
 const deleteExpiredMessages = `-- name: DeleteExpiredMessages :exec
@@ -145,15 +186,19 @@ func (q *Queries) DeleteMessagesByIds(ctx context.Context, db DBTX, arg DeleteMe
 }
 
 const getMaintenanceCandidateTopics = `-- name: GetMaintenanceCandidateTopics :many
+WITH sessions AS MATERIALIZED (
+    SELECT consumer_id, (expires_at < now())::boolean AS expired
+    FROM /*tmpl*/ consumer_sessions /*tmpl*/
+)
 SELECT
     t.topic,
     t.expiration_nanos,
     COALESCE(l.holder_id = $1::uuid, false)::boolean AS held_by_me,
     (l.topic IS NULL)::boolean AS unleased,
-    COALESCE(s.expires_at < now(), l.acquired_at < $2::timestamptz, true)::boolean AS lease_expired
+    COALESCE(s.expired, l.acquired_at < $2::timestamptz, true)::boolean AS lease_expired
 FROM /*tmpl*/ topics /*tmpl*/ t
 LEFT JOIN /*tmpl*/ maintenance_leases /*tmpl*/ l ON l.topic = t.topic
-LEFT JOIN /*tmpl*/ consumer_sessions /*tmpl*/ s ON s.consumer_id = l.holder_id
+LEFT JOIN sessions s ON s.consumer_id = l.holder_id
 WHERE COALESCE(t.expiration_nanos, $3::bigint, 0) > 0
   AND (
     t.topic = ANY($4::text[])
@@ -183,7 +228,11 @@ type GetMaintenanceCandidateTopicsRow struct {
 // that predate the column), plus any topics force-included by the catch-up
 // sweep, together with their maintenance-lease state. Lease liveness defers
 // to the holder's consumer session, falling back to the staleness cutoff for
-// pre-session holders (see SelectMaintenanceLeaseForUpdate).
+// pre-session holders (see SelectMaintenanceLeaseForUpdate). The plan is
+// pinned to a deliberate shape: one seq scan of topics (the activity
+// predicate is unindexable by design), maintenance_leases joined on its
+// primary key, and consumer_sessions — the small side, kept small by the
+// retention sweep — narrowed once into a MATERIALIZED CTE and hashed.
 func (q *Queries) GetMaintenanceCandidateTopics(ctx context.Context, db DBTX, arg GetMaintenanceCandidateTopicsParams) ([]*GetMaintenanceCandidateTopicsRow, error) {
 	rows, err := db.Query(ctx, getMaintenanceCandidateTopics,
 		arg.HolderID,

@@ -54,6 +54,12 @@ func SetMaintenanceCatchupIntervalForTest(d time.Duration) func() {
 	return func() { maintenanceCatchupInterval.Store(old) }
 }
 
+func SetConsumerSessionRetentionForTest(d time.Duration) func() {
+	old := consumerSessionRetention.Load()
+	consumerSessionRetention.Store(d)
+	return func() { consumerSessionRetention.Store(old) }
+}
+
 // ManagedTopicsForTest returns the topics whose maintenance loops o currently
 // tracks. Only compiled during tests.
 func ManagedTopicsForTest(o Outbox) []string {

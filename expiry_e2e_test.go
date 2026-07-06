@@ -522,6 +522,50 @@ func TestExpiry_CatchupSweepCleansOrphanedTopic(t *testing.T) {
 	}, 10*time.Second, 25*time.Millisecond, "the drained topic should release its lease row")
 }
 
+// TestExpiry_CatchupSweepDeletesStaleConsumerSessions: instance ids are
+// per-NewOutbox, so every restart strands one consumer_sessions row; the
+// catch-up sweep garbage-collects rows expired past the retention window so
+// the table stays at O(live instances). Retention is kept comfortably above
+// lease timeouts here because deleting a session downgrades its leases from
+// "expired session, claim immediately" to the acquired_at staleness fallback.
+func TestExpiry_CatchupSweepDeletesStaleConsumerSessions(t *testing.T) {
+	// No t.Parallel() — this test finishes quickly, so its deferred restores
+	// of the scan/catch-up globals would land mid-run of the long parallel
+	// tests that also depend on them (e.g. PreSessionHolderIsRespected).
+
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
+	restoreCatchup := pgoutbox.SetMaintenanceCatchupIntervalForTest(100 * time.Millisecond)
+	defer restoreCatchup()
+	restoreRetention := pgoutbox.SetConsumerSessionRetentionForTest(30 * time.Second)
+	defer restoreRetention()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	_, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	// A session stranded by a dead instance: expired an hour ago, well past
+	// retention.
+	_, err = sharedPool.Exec(ctx, fmt.Sprintf(
+		"INSERT INTO %s.consumer_sessions (consumer_id, expires_at) VALUES (gen_random_uuid(), now() - interval '1 hour')",
+		pgx.Identifier{schema}.Sanitize()))
+	require.NoError(t, err)
+
+	countSessions := func() int {
+		var n int
+		query := fmt.Sprintf("SELECT count(*) FROM %s.consumer_sessions", pgx.Identifier{schema}.Sanitize())
+		require.NoError(t, sharedPool.QueryRow(ctx, query).Scan(&n))
+		return n
+	}
+
+	require.Eventually(t, func() bool {
+		return countSessions() == 1
+	}, 10*time.Second, 25*time.Millisecond, "the sweep should delete the stale session and keep this instance's live one")
+}
+
 func TestExpiry_PreSessionHolderIsRespected(t *testing.T) {
 	t.Parallel()
 
@@ -571,6 +615,45 @@ func TestExpiry_PreSessionHolderIsRespected(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return countMessages(t, ctx, schema, "orders") == 0
 	}, 10*time.Second, 25*time.Millisecond, "the lease should be taken over once acquired_at goes stale")
+}
+
+// TestExpiry_ProcessingBumpsTopicActivity: ProcessMessages holds the topic
+// row lock for its whole transaction, so the insert trigger's SKIP LOCKED
+// activity bump skips continuously-processed topics — potentially every
+// window, leaving a busy topic looking dormant. The flush path compensates
+// by refreshing the activity stamp itself when it processed messages, gated
+// to the trigger's 30s granularity.
+func TestExpiry_ProcessingBumpsTopicActivity(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	ob.AddFlusher("orders", &noopFlusher{})
+	insertMessages(t, ctx, ob, "orders", 2)
+
+	// Simulate a topic whose trigger bumps were all starved: activity is
+	// stale even though messages are flowing.
+	backdateTopicActivity(t, ctx, schema, "orders", time.Hour)
+
+	msgs, err := ob.ProcessMessages(ctx, "orders")
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+
+	bumped := topicActivity(t, ctx, schema, "orders")
+	assert.WithinDuration(t, time.Now(), bumped, time.Minute, "processing must refresh stale topic activity")
+
+	// Inside the 30s window neither the trigger nor a second flush may bump
+	// again — the gate is what keeps this from becoming per-flush row churn.
+	insertMessages(t, ctx, ob, "orders", 1)
+	msgs, err = ob.ProcessMessages(ctx, "orders")
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, bumped, topicActivity(t, ctx, schema, "orders"), "the flush-path bump must respect the 30s gate")
 }
 
 func TestExpiry_TriggerActivityBumpIsGated(t *testing.T) {

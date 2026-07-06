@@ -64,6 +64,27 @@ func TestLeaseWatcher_OnCancelContextIsDetached(t *testing.T) {
 	}
 }
 
+// TestLeaseWatcher_StopSuppressesOnCancel: a deliberate Stop must not fire
+// onCancel — callers stop a watcher exactly when they are about to write
+// lease state themselves, and Stop must not block on a database write it
+// doesn't need.
+func TestLeaseWatcher_StopSuppressesOnCancel(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	w := newLeaseWatcher(func(context.Context, string) {
+		calls.Add(1)
+	})
+
+	w.Start(context.Background(), "orders")
+	w.Stop("orders")
+
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("onCancel fired %d times after a deliberate Stop, want 0", got)
+	}
+}
+
 func TestLeaseWatcher_StopIsNoOpWhenNotRunning(t *testing.T) {
 	t.Parallel()
 
@@ -82,24 +103,36 @@ func TestLeaseWatcher_StopIsNoOpWhenNotRunning(t *testing.T) {
 	}
 }
 
-// TestLeaseWatcher_StopBlocksUntilOnCancelFinishes covers the guarantee
-// callers depend on for lease-state ordering: once Stop has returned, the
-// watcher's onCancel write has fully finished, so anything the caller writes
+// TestLeaseWatcher_StopBlocksUntilInFlightOnCancelFinishes covers the
+// guarantee callers depend on for lease-state ordering: when the watched ctx
+// ends just before Stop is called, Stop must not return until the already
+// in-flight onCancel has fully finished, so anything the caller writes
 // afterwards has the last word.
-func TestLeaseWatcher_StopBlocksUntilOnCancelFinishes(t *testing.T) {
+func TestLeaseWatcher_StopBlocksUntilInFlightOnCancelFinishes(t *testing.T) {
 	t.Parallel()
 
+	entered := make(chan struct{})
 	release := make(chan struct{})
 	var stopReturned atomic.Bool
 
 	w := newLeaseWatcher(func(_ context.Context, _ string) {
+		close(entered)
 		<-release
 		if stopReturned.Load() {
 			t.Error("onCancel was still executing after Stop returned")
 		}
 	})
 
-	w.Start(context.Background(), "orders")
+	ctx, cancel := context.WithCancel(context.Background())
+	w.Start(ctx, "orders")
+
+	// External cancellation puts onCancel in flight before Stop is called.
+	cancel()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for onCancel to start")
+	}
 
 	stopDone := make(chan struct{})
 	go func() {
@@ -111,7 +144,7 @@ func TestLeaseWatcher_StopBlocksUntilOnCancelFinishes(t *testing.T) {
 	// Stop must block while onCancel is still running.
 	select {
 	case <-stopDone:
-		t.Fatal("Stop returned before onCancel finished")
+		t.Fatal("Stop returned before the in-flight onCancel finished")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -124,31 +157,41 @@ func TestLeaseWatcher_StopBlocksUntilOnCancelFinishes(t *testing.T) {
 	}
 }
 
-// TestLeaseWatcher_StartRestartsWithoutOverlap: restarting a topic must fully
-// stop the previous watcher (firing its onCancel) before the new goroutine
-// begins, so onCancel calls for one topic never run concurrently.
-func TestLeaseWatcher_StartRestartsWithoutOverlap(t *testing.T) {
+// TestLeaseWatcher_StartRestartsWithoutFiring: restarting a topic stops the
+// previous watcher without firing its onCancel; only the final watcher's
+// external cancellation fires, exactly once.
+func TestLeaseWatcher_StartRestartsWithoutFiring(t *testing.T) {
 	t.Parallel()
 
-	var active, calls atomic.Int32
-	w := newLeaseWatcher(func(_ context.Context, _ string) {
-		if active.Add(1) > 1 {
-			t.Error("concurrent onCancel calls detected for the same topic")
-		}
+	var calls atomic.Int32
+	w := newLeaseWatcher(func(context.Context, string) {
 		calls.Add(1)
-		time.Sleep(2 * time.Millisecond)
-		active.Add(-1)
 	})
 
+	ctx, cancel := context.WithCancel(context.Background())
 	w.Start(context.Background(), "orders")
 	for range 5 {
-		// Each restart stops the previous watcher, firing its onCancel.
 		w.Start(context.Background(), "orders")
 	}
-	w.Stop("orders")
+	w.Start(ctx, "orders")
 
-	if got := calls.Load(); got != 6 {
-		t.Fatalf("onCancel fired %d times across 6 watcher lifetimes, want 6", got)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("onCancel fired %d times across restarts, want 0", got)
+	}
+
+	cancel()
+
+	deadline := time.After(2 * time.Second)
+	for calls.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for the final watcher to fire")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("onCancel fired %d times, want exactly 1 (the final watcher)", got)
 	}
 }
 
@@ -204,19 +247,28 @@ func TestLeaseWatcher_TopicsAreIndependent(t *testing.T) {
 		}
 	})
 
-	w.Start(context.Background(), "orders")
+	ordersCtx, cancelOrders := context.WithCancel(context.Background())
+	w.Start(ordersCtx, "orders")
 	w.Start(context.Background(), "invoices")
 
-	w.Stop("orders")
-	if got := ordersCalls.Load(); got != 1 {
-		t.Fatalf("orders onCancel fired %d times after Stop, want 1", got)
+	// Cancelling orders fires only the orders watcher.
+	cancelOrders()
+	deadline := time.After(2 * time.Second)
+	for ordersCalls.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for the orders watcher to fire")
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 	if got := invoicesCalls.Load(); got != 0 {
-		t.Fatalf("stopping orders fired the invoices watcher: %d calls", got)
+		t.Fatalf("cancelling orders fired the invoices watcher: %d calls", got)
 	}
 
+	// Stopping invoices fires nothing.
 	w.Stop("invoices")
-	if got := invoicesCalls.Load(); got != 1 {
-		t.Fatalf("invoices onCancel fired %d times after Stop, want 1", got)
+	time.Sleep(50 * time.Millisecond)
+	if got := invoicesCalls.Load(); got != 0 {
+		t.Fatalf("stopping invoices fired its onCancel: %d calls", got)
 	}
 }

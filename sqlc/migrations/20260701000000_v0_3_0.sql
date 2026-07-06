@@ -24,8 +24,12 @@ BEGIN
     -- topic, bounding write churn on the topics table regardless of insert
     -- rate. FOR UPDATE SKIP LOCKED: the winning producer's row lock is held
     -- until its transaction commits, so at window rollover concurrent
-    -- producers skip the bump instead of queueing behind it — the timestamp
-    -- is coarse by design, and a skipped bump costs nothing.
+    -- producers skip the bump instead of queueing behind it — and producers
+    -- never block behind a ProcessMessages flush, which holds the topic row
+    -- lock for its whole transaction. On a continuously-flushed topic that
+    -- means every trigger bump can be skipped; the flush path compensates by
+    -- bumping activity itself (BumpTopicActivityIfStale) under the very lock
+    -- that causes the skips.
     EXECUTE format(
         $q$UPDATE %I.topics t
            SET last_inserted_at = now()
