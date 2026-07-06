@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -116,6 +118,24 @@ const maintenanceIdleInterval = 30 * time.Second
 // an error or after losing a lease competition.
 const maintenanceRetryInterval = 5 * time.Second
 
+// maintenanceMinInterval floors every sleep between maintenance-loop
+// iterations, so a topic whose oldest message keeps hovering near the TTL
+// boundary cannot re-peek in a tight loop. Exposed as a var for tests.
+var maintenanceMinInterval = newAtomicDuration(5 * time.Second)
+
+// maintenanceActivitySlack widens the window during which a topic counts as
+// active beyond its TTL. It must cover the insert trigger's bump granularity
+// (30s) plus at least one scan interval, so the final cleanup pass reliably
+// runs before a topic goes dormant. Exposed as a var for tests.
+var maintenanceActivitySlack = newAtomicDuration(2 * time.Minute)
+
+// maintenanceCatchupInterval is how often the scanner force-includes every
+// topic that still holds messages regardless of activity, recovering topics
+// whose final cleanup pass was missed or whose TTL was configured after
+// their last insert. Also runs on the first scan after startup. Exposed as a
+// var for tests.
+var maintenanceCatchupInterval = newAtomicDuration(time.Hour)
+
 // exclusiveLeaseDuration is how far ahead each consumer-session heartbeat
 // pushes the session's expiry, and the length of the grace period granted
 // when a holder's AcquireTopic ctx is cancelled. An instance that stops
@@ -173,6 +193,12 @@ type outboxImpl struct {
 	// session. AcquireTopic starts it per topic; ReleaseTopic stops it before
 	// clearing the lease.
 	exclusiveLeaseWatcher *leaseWatcher
+
+	// managed tracks the maintenance-loop goroutine for each topic whose
+	// maintenance lease this instance currently holds. Written only by the
+	// scanner goroutine; the mutex exists for test introspection.
+	managedMu sync.Mutex
+	managed   map[string]*managedTopic
 }
 
 type OutboxOpt func(*outboxImplOpts)
@@ -258,6 +284,7 @@ func NewOutbox(ctx context.Context, pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox
 		expirations:       expirations,
 		defaultExpiration: opts.defaultExpiration,
 		logger:            opts.logger,
+		managed:           make(map[string]*managedTopic),
 	}
 	o.exclusiveLeaseWatcher = newLeaseWatcher(o.expireExclusiveLeaseAfterGrace)
 
@@ -593,41 +620,33 @@ func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string, popts ..
 	return msgs, nil
 }
 
-// runTopicScanner polls the topics table and spawns a maintenance goroutine
-// for each topic that is not already being managed. TTL resolution order:
-// per-topic expiration_nanos from the DB, then defaultExpiration, then skip.
+// managedTopic tracks one running maintenance loop. dormant distinguishes a
+// scanner-initiated stop (topic left the active window: final cleanup pass
+// and lease release on the way out) from plain shutdown (exit with zero
+// writes; the consumer session lapsing is the release).
+type managedTopic struct {
+	cancel  context.CancelFunc
+	done    chan struct{}
+	dormant atomic.Bool
+}
+
+// runTopicScanner periodically scans for active topics (last insert within
+// TTL + slack), claims a fair share of their maintenance leases for this
+// instance, and manages one maintenance goroutine per claimed topic. Claimed
+// leases carry no expiry of their own: they stay valid exactly as long as
+// this instance's consumer session, so holding them costs zero per-topic
+// writes and a crashed instance's topics free up as soon as its session
+// lapses. Dormant topics cost nothing on any instance: no goroutine, no
+// peek queries, no lease row.
 func (o *outboxImpl) runTopicScanner(ctx context.Context) {
-	managed := make(map[string]struct{})
+	var lastCatchup time.Time
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		rows, err := o.queries.GetAllTopics(ctx, dbwrap.New(o.pool, o.schema))
-		if err != nil {
-			o.logger.Error().Err(err).Msg("maintenance: failed to scan topics table")
-		} else {
-			for _, row := range rows {
-				if _, ok := managed[row.Topic]; ok {
-					continue
-				}
-
-				var ttl time.Duration
-				if row.ExpirationNanos.Valid {
-					ttl = time.Duration(row.ExpirationNanos.Int64)
-				} else {
-					ttl = o.defaultExpiration
-				}
-
-				if ttl == 0 {
-					continue
-				}
-
-				managed[row.Topic] = struct{}{}
-				go o.runMaintenanceLoop(ctx, row.Topic, ttl)
-			}
-		}
+		lastCatchup = o.scanTopics(ctx, lastCatchup)
 
 		select {
 		case <-ctx.Done():
@@ -637,63 +656,285 @@ func (o *outboxImpl) runTopicScanner(ctx context.Context) {
 	}
 }
 
-func (o *outboxImpl) runMaintenanceLoop(ctx context.Context, topic string, ttl time.Duration) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
+// scanTopics runs one scanner tick and returns the updated time of the last
+// successful catch-up sweep.
+func (o *outboxImpl) scanTopics(ctx context.Context, lastCatchup time.Time) time.Time {
+	wrapped := dbwrap.New(o.pool, o.schema)
 
+	o.reapExitedLoops()
+
+	// The catch-up sweep force-includes every topic that still holds
+	// messages, active or not: it recovers topics whose final cleanup pass
+	// was missed (e.g. the whole fleet was down at the wrong moment) and
+	// topics whose TTL was configured after their last insert was already
+	// older than it. The zero time on the first tick makes it always run at
+	// startup.
+	include := []string{}
+	if time.Since(lastCatchup) >= maintenanceCatchupInterval.Load() {
+		topics, err := o.queries.GetTopicsWithMessages(ctx, wrapped)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				o.logger.Error().Err(err).Msg("maintenance: failed to list topics with messages for catch-up sweep")
+			}
+		} else {
+			include = topics
+			lastCatchup = time.Now()
+		}
+	}
+
+	defaultNanos := pgtype.Int8{}
+	if o.defaultExpiration > 0 {
+		defaultNanos = pgtype.Int8{Int64: o.defaultExpiration.Nanoseconds(), Valid: true}
+	}
+
+	candidates, err := o.queries.GetMaintenanceCandidateTopics(ctx, wrapped, sqlc.GetMaintenanceCandidateTopicsParams{
+		HolderID:               o.instanceID,
+		StaleCutoff:            pgtype.Timestamptz{Time: time.Now().UTC().Add(-maintenanceLeaseTimeout.Load()), Valid: true},
+		DefaultExpirationNanos: defaultNanos,
+		IncludeTopics:          include,
+		SlackSeconds:           maintenanceActivitySlack.Load().Seconds(),
+	})
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			o.logger.Error().Err(err).Msg("maintenance: failed to scan topics table")
+		}
+		return lastCatchup
+	}
+
+	ttls := make(map[string]time.Duration, len(candidates))
+	var held, claimNew, claimStale []string
+	for _, c := range candidates {
+		ttl := o.defaultExpiration
+		if c.ExpirationNanos.Valid {
+			ttl = time.Duration(c.ExpirationNanos.Int64)
+		}
+		if ttl <= 0 {
+			continue
+		}
+		ttls[c.Topic] = ttl
+		switch {
+		case c.HeldByMe:
+			held = append(held, c.Topic)
+		case c.Unleased:
+			claimNew = append(claimNew, c.Topic)
+		case c.LeaseExpired:
+			claimStale = append(claimStale, c.Topic)
+		}
+	}
+
+	held = append(held, o.claimTopics(ctx, wrapped, len(ttls), len(held), claimNew, claimStale)...)
+
+	o.reconcileLoops(ctx, ttls, held)
+	return lastCatchup
+}
+
+// claimTopics claims up to this instance's fair share (ceil(candidates /
+// live sessions)) of the claimable topics, in random order so concurrently
+// scanning instances spread across the set instead of contending on the same
+// prefix. Returns the topics actually won; claims lost to SKIP LOCKED or the
+// insert conflict arm simply come back around on a later scan.
+func (o *outboxImpl) claimTopics(ctx context.Context, wrapped *dbwrap.Wrapper, candidates, held int, claimNew, claimStale []string) []string {
+	if len(claimNew)+len(claimStale) == 0 {
+		return nil
+	}
+
+	live, err := o.queries.CountLiveConsumerSessions(ctx, wrapped)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			o.logger.Error().Err(err).Msg("maintenance: failed to count live consumer sessions")
+		}
+		return nil
+	}
+	if live < 1 {
+		live = 1
+	}
+
+	// The fair-share cap spreads load; it is not a correctness constraint. The
+	// floor of 1 keeps claimable topics from being stranded: this instance may
+	// be the only one whose configuration (e.g. WithDefaultExpiration) makes
+	// it eligible to maintain them, and the live-session count cannot see that.
+	budget := max((candidates+int(live)-1)/int(live)-held, 1)
+
+	rand.Shuffle(len(claimNew), func(i, j int) { claimNew[i], claimNew[j] = claimNew[j], claimNew[i] })
+	rand.Shuffle(len(claimStale), func(i, j int) { claimStale[i], claimStale[j] = claimStale[j], claimStale[i] })
+
+	var won []string
+	if len(claimNew) > 0 {
+		topics, err := o.queries.InsertMaintenanceLeases(ctx, wrapped, sqlc.InsertMaintenanceLeasesParams{
+			Topics:   claimNew[:min(budget, len(claimNew))],
+			HolderID: o.instanceID,
+		})
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				o.logger.Error().Err(err).Msg("maintenance: failed to claim unleased topics")
+			}
+		} else {
+			won = append(won, topics...)
+			budget -= len(topics)
+		}
+	}
+	if budget > 0 && len(claimStale) > 0 {
+		topics, err := o.queries.ClaimMaintenanceLeases(ctx, wrapped, sqlc.ClaimMaintenanceLeasesParams{
+			Topics:      claimStale[:min(budget, len(claimStale))],
+			HolderID:    o.instanceID,
+			StaleCutoff: pgtype.Timestamptz{Time: time.Now().UTC().Add(-maintenanceLeaseTimeout.Load()), Valid: true},
+		})
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				o.logger.Error().Err(err).Msg("maintenance: failed to take over expired maintenance leases")
+			}
+		} else {
+			won = append(won, topics...)
+		}
+	}
+	return won
+}
+
+// reconcileLoops starts a maintenance goroutine for every held topic that
+// doesn't have one and cancels goroutines whose topic left the candidate set
+// (dormancy: final cleanup pass and lease release happen on the way out) or
+// whose lease this instance no longer holds (exit with no writes). A
+// cancelled loop stays in managed until reaped, so a topic that reactivates
+// during its dormancy exit can never end up with two loops.
+func (o *outboxImpl) reconcileLoops(ctx context.Context, ttls map[string]time.Duration, held []string) {
+	heldSet := make(map[string]struct{}, len(held))
+	for _, topic := range held {
+		heldSet[topic] = struct{}{}
+	}
+
+	o.managedMu.Lock()
+	defer o.managedMu.Unlock()
+
+	for topic, mt := range o.managed {
+		if _, active := ttls[topic]; !active {
+			mt.dormant.Store(true)
+			mt.cancel()
+		} else if _, ours := heldSet[topic]; !ours {
+			mt.cancel()
+		}
+	}
+
+	for _, topic := range held {
+		if _, ok := o.managed[topic]; ok {
+			continue
+		}
+		loopCtx, cancel := context.WithCancel(ctx)
+		mt := &managedTopic{cancel: cancel, done: make(chan struct{})}
+		o.managed[topic] = mt
+		go o.runMaintenanceLoop(loopCtx, topic, ttls[topic], mt)
+	}
+}
+
+// reapExitedLoops drops managed entries whose goroutine has fully exited.
+func (o *outboxImpl) reapExitedLoops() {
+	o.managedMu.Lock()
+	defer o.managedMu.Unlock()
+	for topic, mt := range o.managed {
+		select {
+		case <-mt.done:
+			delete(o.managed, topic)
+		default:
+		}
+	}
+}
+
+func (o *outboxImpl) runMaintenanceLoop(ctx context.Context, topic string, ttl time.Duration, mt *managedTopic) {
+	defer close(mt.done)
+
+	// sleep waits at least maintenanceMinInterval and reports false once ctx
+	// has ended.
+	sleep := func(d time.Duration) bool {
+		if floor := maintenanceMinInterval.Load(); d < floor {
+			d = floor
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(d):
+			return true
+		}
+	}
+
+	for ctx.Err() == nil {
 		wrapped := dbwrap.New(o.pool, o.schema)
 
 		oldest, err := o.queries.GetOldestMessageInsertedAt(ctx, wrapped, topic)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(maintenanceIdleInterval):
+				if !sleep(maintenanceIdleInterval) {
+					break
 				}
 				continue
 			}
-			o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to peek oldest message")
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(maintenanceRetryInterval):
+			if !errors.Is(err, context.Canceled) {
+				o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to peek oldest message")
+			}
+			if !sleep(maintenanceRetryInterval) {
+				break
 			}
 			continue
 		}
 
 		if !oldest.Valid {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(maintenanceIdleInterval):
+			if !sleep(maintenanceIdleInterval) {
+				break
 			}
 			continue
 		}
 
 		expireAt := oldest.Time.Add(ttl)
 		if now := time.Now(); expireAt.After(now) {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(expireAt.Sub(now)):
+			if !sleep(expireAt.Sub(now)) {
+				break
 			}
 			continue
 		}
 
 		if err := o.runMaintenance(ctx, topic, ttl); err != nil {
-			if !errors.Is(err, errLeaseHeld) {
+			if !errors.Is(err, errLeaseHeld) && !errors.Is(err, context.Canceled) {
 				o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to run cleanup")
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(maintenanceRetryInterval):
-			}
-			continue
 		}
+		if !sleep(maintenanceRetryInterval) {
+			break
+		}
+	}
+
+	if mt.dormant.Load() {
+		o.finishDormantTopic(context.WithoutCancel(ctx), topic, ttl)
+	}
+}
+
+// finishDormantTopic is the dormancy exit for a maintenance loop: by the time
+// the scanner stops a topic, every message it still holds is older than its
+// TTL by construction (the activity window is TTL + slack), so one final
+// cleanup pass empties it. The lease row is deleted only after an empty-topic
+// check: if a message raced in, the insert trigger has already re-marked the
+// topic active and a later scan re-claims it, so leaving the lease in place
+// loses nothing.
+func (o *outboxImpl) finishDormantTopic(ctx context.Context, topic string, ttl time.Duration) {
+	if err := o.runMaintenance(ctx, topic, ttl); err != nil {
+		if !errors.Is(err, errLeaseHeld) {
+			o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to run final cleanup for dormant topic")
+		}
+		return
+	}
+
+	wrapped := dbwrap.New(o.pool, o.schema)
+	_, err := o.queries.GetOldestMessageInsertedAt(ctx, wrapped, topic)
+	if err == nil {
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to verify dormant topic is empty")
+		return
+	}
+
+	if err := o.queries.ReleaseMaintenanceLease(ctx, wrapped, sqlc.ReleaseMaintenanceLeaseParams{
+		Topic:    topic,
+		HolderID: o.instanceID,
+	}); err != nil {
+		o.logger.Error().Err(err).Str("topic", topic).Msg("maintenance: failed to release lease for dormant topic")
 	}
 }
 
@@ -715,15 +956,15 @@ func (o *outboxImpl) runMaintenance(ctx context.Context, topic string, ttl time.
 		return fmt.Errorf("upsert maintenance lease for topic %q: %w", topic, err)
 	}
 
-	lease, err := o.queries.SelectMaintenanceLeaseForUpdate(ctx, wrapped, topic)
+	lease, err := o.queries.SelectMaintenanceLeaseForUpdate(ctx, wrapped, sqlc.SelectMaintenanceLeaseForUpdateParams{
+		Topic:       topic,
+		StaleCutoff: pgtype.Timestamptz{Time: time.Now().UTC().Add(-maintenanceLeaseTimeout.Load()), Valid: true},
+	})
 	if err != nil {
 		return fmt.Errorf("select maintenance lease for topic %q: %w", topic, err)
 	}
 
-	holdsLease := lease.HolderID == o.instanceID
-	leaseExpired := time.Since(lease.AcquiredAt.Time) > maintenanceLeaseTimeout.Load()
-
-	if !holdsLease && !leaseExpired {
+	if lease.HolderID != o.instanceID && !lease.LeaseExpired {
 		return errLeaseHeld
 	}
 

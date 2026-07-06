@@ -35,3 +35,34 @@ func SetExclusiveLeaseRetryIntervalForTest(d time.Duration) func() {
 	exclusiveLeaseRetryInterval.Store(d)
 	return func() { exclusiveLeaseRetryInterval.Store(old) }
 }
+
+func SetMaintenanceMinIntervalForTest(d time.Duration) func() {
+	old := maintenanceMinInterval.Load()
+	maintenanceMinInterval.Store(d)
+	return func() { maintenanceMinInterval.Store(old) }
+}
+
+func SetMaintenanceActivitySlackForTest(d time.Duration) func() {
+	old := maintenanceActivitySlack.Load()
+	maintenanceActivitySlack.Store(d)
+	return func() { maintenanceActivitySlack.Store(old) }
+}
+
+func SetMaintenanceCatchupIntervalForTest(d time.Duration) func() {
+	old := maintenanceCatchupInterval.Load()
+	maintenanceCatchupInterval.Store(d)
+	return func() { maintenanceCatchupInterval.Store(old) }
+}
+
+// ManagedTopicsForTest returns the topics whose maintenance loops o currently
+// tracks. Only compiled during tests.
+func ManagedTopicsForTest(o Outbox) []string {
+	impl := o.(*outboxImpl)
+	impl.managedMu.Lock()
+	defer impl.managedMu.Unlock()
+	topics := make([]string, 0, len(impl.managed))
+	for topic := range impl.managed {
+		topics = append(topics, topic)
+	}
+	return topics
+}

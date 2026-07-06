@@ -32,4 +32,5 @@ type Topic struct {
 	ExpirationNanos            pgtype.Int8        `json:"expiration_nanos"`
 	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
 	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
+	LastInsertedAt             pgtype.Timestamptz `json:"last_inserted_at"`
 }

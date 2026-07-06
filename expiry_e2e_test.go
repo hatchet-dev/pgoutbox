@@ -51,6 +51,79 @@ func setupOutbox(t *testing.T, ctx context.Context, schema string) pgoutbox.Outb
 	return ob
 }
 
+// rawInsertMessages inserts n messages directly via SQL, without an outbox
+// instance — the insert trigger still registers the topic and bumps its
+// activity, but no extra consumer session is created, which keeps
+// fair-share-sensitive tests deterministic.
+func rawInsertMessages(t *testing.T, ctx context.Context, schema, topic string, n int) {
+	t.Helper()
+	query := fmt.Sprintf(
+		"INSERT INTO %s.messages (topic, payload) SELECT $1::text, '{}'::jsonb FROM generate_series(1, $2::int)",
+		pgx.Identifier{schema}.Sanitize(),
+	)
+	_, err := sharedPool.Exec(ctx, query, topic, n)
+	require.NoError(t, err)
+}
+
+// backdateTopicActivity sets topics.last_inserted_at = now - age, simulating
+// a topic whose last insert happened in the past.
+func backdateTopicActivity(t *testing.T, ctx context.Context, schema, topic string, age time.Duration) {
+	t.Helper()
+	target := time.Now().UTC().Add(-age)
+	query := fmt.Sprintf(
+		"UPDATE %s.topics SET last_inserted_at = $1 WHERE topic = $2",
+		pgx.Identifier{schema}.Sanitize(),
+	)
+	_, err := sharedPool.Exec(ctx, query, target, topic)
+	require.NoError(t, err)
+}
+
+// topicActivity reads topics.last_inserted_at for the given topic.
+func topicActivity(t *testing.T, ctx context.Context, schema, topic string) time.Time {
+	t.Helper()
+	query := fmt.Sprintf(
+		"SELECT last_inserted_at FROM %s.topics WHERE topic = $1",
+		pgx.Identifier{schema}.Sanitize(),
+	)
+	var ts time.Time
+	require.NoError(t, sharedPool.QueryRow(ctx, query, topic).Scan(&ts))
+	return ts
+}
+
+// hasMaintenanceLease reports whether a maintenance_leases row exists for the
+// given topic.
+func hasMaintenanceLease(t *testing.T, ctx context.Context, schema, topic string) bool {
+	t.Helper()
+	query := fmt.Sprintf(
+		"SELECT EXISTS(SELECT 1 FROM %s.maintenance_leases WHERE topic = $1)",
+		pgx.Identifier{schema}.Sanitize(),
+	)
+	var exists bool
+	require.NoError(t, sharedPool.QueryRow(ctx, query, topic).Scan(&exists))
+	return exists
+}
+
+// maintenanceLeaseHolders returns lease counts per holder across the schema.
+func maintenanceLeaseHolders(t *testing.T, ctx context.Context, schema string) map[string]int {
+	t.Helper()
+	query := fmt.Sprintf(
+		"SELECT holder_id::text, COUNT(*) FROM %s.maintenance_leases GROUP BY 1",
+		pgx.Identifier{schema}.Sanitize(),
+	)
+	rows, err := sharedPool.Query(ctx, query)
+	require.NoError(t, err)
+	defer rows.Close()
+	holders := make(map[string]int)
+	for rows.Next() {
+		var holder string
+		var count int
+		require.NoError(t, rows.Scan(&holder, &count))
+		holders[holder] = count
+	}
+	require.NoError(t, rows.Err())
+	return holders
+}
+
 func TestExpiry_ExpiredMessagesAreDeleted(t *testing.T) {
 	t.Parallel()
 
@@ -177,21 +250,29 @@ func TestExpiry_LeaseExclusion(t *testing.T) {
 func TestExpiry_LeaseHandoff(t *testing.T) {
 	t.Parallel()
 
-	// Use a very short lease timeout so the handoff happens in milliseconds.
-	restore := pgoutbox.SetMaintenanceLeaseTimeoutForTest(200 * time.Millisecond)
-	defer restore()
+	// Maintenance leases defer to the holder's consumer session for liveness,
+	// so failover is driven by the dead instance's session lapsing: shorten
+	// the session heartbeat rather than the pre-session lease timeout.
+	restoreDur := pgoutbox.SetExclusiveLeaseDurationForTest(500 * time.Millisecond)
+	defer restoreDur()
+	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(100 * time.Millisecond)
+	defer restoreRenew()
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
+	restoreMin := pgoutbox.SetMaintenanceMinIntervalForTest(20 * time.Millisecond)
+	defer restoreMin()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	schema := uniqueSchema(t)
-	setup := setupOutbox(t, ctx, schema)
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)))
 
 	ctxA, cancelA := context.WithCancel(ctx)
 
 	// Insert and backdate the first batch before starting A so A's maintenance
 	// loop finds old messages immediately.
-	insertMessages(t, ctx, setup, "orders", 2)
+	rawInsertMessages(t, ctx, schema, "orders", 2)
 	backdateMessages(t, ctx, schema, "orders", 2*time.Hour)
 
 	obA, err := pgoutbox.NewOutbox(
@@ -203,18 +284,16 @@ func TestExpiry_LeaseHandoff(t *testing.T) {
 	require.NoError(t, err)
 	_ = obA
 
-	time.Sleep(300 * time.Millisecond)
-	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"), "A should clean up the first batch")
+	require.Eventually(t, func() bool {
+		return countMessages(t, ctx, schema, "orders") == 0
+	}, 10*time.Second, 25*time.Millisecond, "A should clean up the first batch")
 
-	// Insert a second batch that B will need to clean up.
-	insertMessages(t, ctx, setup, "orders", 2)
+	// Insert a second batch that B will need to clean up, then stop A. A's
+	// shutdown performs no release writes: its lease frees up purely by its
+	// consumer session lapsing.
+	rawInsertMessages(t, ctx, schema, "orders", 2)
 	backdateMessages(t, ctx, schema, "orders", 2*time.Hour)
-
-	// Stop A — it no longer renews the lease.
 	cancelA()
-
-	// Wait for A's lease to expire, then start B.
-	time.Sleep(300 * time.Millisecond)
 
 	_, err = pgoutbox.NewOutbox(
 		ctx,
@@ -224,9 +303,9 @@ func TestExpiry_LeaseHandoff(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	time.Sleep(300 * time.Millisecond)
-
-	assert.Equal(t, 0, countMessages(t, ctx, schema, "orders"), "B should claim the expired lease and clean up")
+	require.Eventually(t, func() bool {
+		return countMessages(t, ctx, schema, "orders") == 0
+	}, 10*time.Second, 25*time.Millisecond, "B should take over the lapsed lease and clean up")
 }
 
 func TestExpiry_NoExpirationsIsNoop(t *testing.T) {
@@ -244,6 +323,9 @@ func TestExpiry_NoExpirationsIsNoop(t *testing.T) {
 
 func TestExpiry_DefaultExpiration(t *testing.T) {
 	t.Parallel()
+
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -269,16 +351,19 @@ func TestExpiry_DefaultExpiration(t *testing.T) {
 	require.NoError(t, err)
 	_ = ob
 
-	time.Sleep(400 * time.Millisecond)
-
 	// "dynamic" used the 100ms default → cleaned up.
-	assert.Equal(t, 0, countMessages(t, ctx, schema, "dynamic"), "default expiration should clean up dynamic topics")
-	// "known" has a 10s explicit TTL → messages are only 500ms old, not expired.
+	require.Eventually(t, func() bool {
+		return countMessages(t, ctx, schema, "dynamic") == 0
+	}, 5*time.Second, 25*time.Millisecond, "default expiration should clean up dynamic topics")
+	// "known" has a 10s explicit TTL → its messages are not expired yet.
 	assert.Equal(t, 2, countMessages(t, ctx, schema, "known"), "per-topic TTL should take precedence over default")
 }
 
 func TestExpiry_MultiTopicDifferentTTLs(t *testing.T) {
 	t.Parallel()
+
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -303,8 +388,209 @@ func TestExpiry_MultiTopicDifferentTTLs(t *testing.T) {
 	require.NoError(t, err)
 	_ = ob
 
-	time.Sleep(400 * time.Millisecond)
-
-	assert.Equal(t, 0, countMessages(t, ctx, schema, "fast"), "fast-topic messages should be expired")
+	require.Eventually(t, func() bool {
+		return countMessages(t, ctx, schema, "fast") == 0
+	}, 5*time.Second, 25*time.Millisecond, "fast-topic messages should be expired")
 	assert.Equal(t, 3, countMessages(t, ctx, schema, "slow"), "slow-topic messages should survive")
+}
+
+func TestExpiry_DormantTopicReleasesLeaseAndRevives(t *testing.T) {
+	t.Parallel()
+
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
+	restoreSlack := pgoutbox.SetMaintenanceActivitySlackForTest(500 * time.Millisecond)
+	defer restoreSlack()
+	restoreMin := pgoutbox.SetMaintenanceMinIntervalForTest(20 * time.Millisecond)
+	defer restoreMin()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)))
+
+	rawInsertMessages(t, ctx, schema, "orders", 3)
+	backdateMessages(t, ctx, schema, "orders", 2*time.Hour)
+
+	ob, err := pgoutbox.NewOutbox(
+		ctx,
+		sharedPool,
+		pgoutbox.WithSchema(schema),
+		pgoutbox.WithTopicExpiration("orders", 100*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		return countMessages(t, ctx, schema, "orders") == 0
+	}, 10*time.Second, 25*time.Millisecond, "first batch should be cleaned up")
+
+	// Age the topic out of its activity window: the scanner must stop the
+	// maintenance loop, run its final cleanup pass, and delete the lease row,
+	// leaving the dormant topic with zero goroutines and zero lease state.
+	backdateTopicActivity(t, ctx, schema, "orders", time.Hour)
+
+	require.Eventually(t, func() bool {
+		return len(pgoutbox.ManagedTopicsForTest(ob)) == 0 && !hasMaintenanceLease(t, ctx, schema, "orders")
+	}, 10*time.Second, 25*time.Millisecond, "dormant topic should be unmanaged with no lease row")
+
+	// Reactivate: the insert trigger bumps last_inserted_at, the next scan
+	// re-claims the topic, and cleanup resumes.
+	rawInsertMessages(t, ctx, schema, "orders", 2)
+	backdateMessages(t, ctx, schema, "orders", 2*time.Hour)
+
+	require.Eventually(t, func() bool {
+		return countMessages(t, ctx, schema, "orders") == 0
+	}, 10*time.Second, 25*time.Millisecond, "reactivated topic should be cleaned up again")
+}
+
+func TestExpiry_MaintenanceFederatesAcrossInstances(t *testing.T) {
+	t.Parallel()
+
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	// Both instances (and so both consumer sessions) exist before any topic
+	// does, so the fair-share cap applies from each instance's first claim.
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema), pgoutbox.WithDefaultExpiration(time.Hour))
+	require.NoError(t, err)
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema), pgoutbox.WithDefaultExpiration(time.Hour))
+	require.NoError(t, err)
+	_ = obB
+
+	const topics = 40
+	for i := range topics {
+		insertMessages(t, ctx, obA, fmt.Sprintf("topic-%02d", i), 1)
+	}
+
+	require.Eventually(t, func() bool {
+		holders := maintenanceLeaseHolders(t, ctx, schema)
+		total := 0
+		minHeld := topics
+		for _, n := range holders {
+			total += n
+			minHeld = min(minHeld, n)
+		}
+		return total == topics && len(holders) == 2 && minHeld >= topics/4
+	}, 15*time.Second, 100*time.Millisecond, "maintenance leases should be spread across both instances")
+}
+
+func TestExpiry_CatchupSweepCleansOrphanedTopic(t *testing.T) {
+	t.Parallel()
+
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
+	restoreSlack := pgoutbox.SetMaintenanceActivitySlackForTest(300 * time.Millisecond)
+	defer restoreSlack()
+	restoreMin := pgoutbox.SetMaintenanceMinIntervalForTest(20 * time.Millisecond)
+	defer restoreMin()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)))
+
+	// A topic that is dormant from birth: its activity window already lapsed
+	// with expired messages still inside (as happens when a TTL is configured
+	// only after the topic's last insert was already older than it). Only the
+	// catch-up sweep can find it.
+	rawInsertMessages(t, ctx, schema, "orders", 3)
+	backdateMessages(t, ctx, schema, "orders", 2*time.Hour)
+	backdateTopicActivity(t, ctx, schema, "orders", 2*time.Hour)
+
+	ob, err := pgoutbox.NewOutbox(
+		ctx,
+		sharedPool,
+		pgoutbox.WithSchema(schema),
+		pgoutbox.WithTopicExpiration("orders", 100*time.Millisecond),
+	)
+	require.NoError(t, err)
+	_ = ob
+
+	require.Eventually(t, func() bool {
+		return countMessages(t, ctx, schema, "orders") == 0
+	}, 10*time.Second, 25*time.Millisecond, "catch-up sweep should find and clean the dormant topic")
+
+	require.Eventually(t, func() bool {
+		return !hasMaintenanceLease(t, ctx, schema, "orders")
+	}, 10*time.Second, 25*time.Millisecond, "the drained topic should release its lease row")
+}
+
+func TestExpiry_PreSessionHolderIsRespected(t *testing.T) {
+	t.Parallel()
+
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
+	restoreTimeout := pgoutbox.SetMaintenanceLeaseTimeoutForTest(1500 * time.Millisecond)
+	defer restoreTimeout()
+	restoreMin := pgoutbox.SetMaintenanceMinIntervalForTest(20 * time.Millisecond)
+	defer restoreMin()
+	// Parallel tests shrink the activity slack globally, which can age this
+	// topic out of its window while the foreign lease is still being honored.
+	// A short catch-up interval keeps the topic a candidate throughout (it
+	// holds messages), so the takeover happens as soon as the lease is stale.
+	restoreCatchup := pgoutbox.SetMaintenanceCatchupIntervalForTest(200 * time.Millisecond)
+	defer restoreCatchup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)))
+
+	rawInsertMessages(t, ctx, schema, "orders", 3)
+	backdateMessages(t, ctx, schema, "orders", 2*time.Hour)
+
+	// A lease held by an instance with no consumer session row, exactly as a
+	// pre-session version of pgoutbox writes it. It must be honored until
+	// acquired_at goes stale, and be claimable afterward.
+	query := fmt.Sprintf(
+		"INSERT INTO %s.maintenance_leases (topic, holder_id) VALUES ($1, gen_random_uuid())",
+		pgx.Identifier{schema}.Sanitize(),
+	)
+	_, err := sharedPool.Exec(ctx, query, "orders")
+	require.NoError(t, err)
+
+	_, err = pgoutbox.NewOutbox(
+		ctx,
+		sharedPool,
+		pgoutbox.WithSchema(schema),
+		pgoutbox.WithTopicExpiration("orders", 100*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	time.Sleep(500 * time.Millisecond)
+	assert.Equal(t, 3, countMessages(t, ctx, schema, "orders"), "a fresh pre-session lease must not be stolen")
+
+	require.Eventually(t, func() bool {
+		return countMessages(t, ctx, schema, "orders") == 0
+	}, 10*time.Second, 25*time.Millisecond, "the lease should be taken over once acquired_at goes stale")
+}
+
+func TestExpiry_TriggerActivityBumpIsGated(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)))
+
+	rawInsertMessages(t, ctx, schema, "orders", 1)
+	first := topicActivity(t, ctx, schema, "orders")
+
+	rawInsertMessages(t, ctx, schema, "orders", 1)
+	second := topicActivity(t, ctx, schema, "orders")
+	assert.True(t, second.Equal(first), "an insert within the 30s gate window must not bump last_inserted_at")
+
+	backdateTopicActivity(t, ctx, schema, "orders", time.Hour)
+	rawInsertMessages(t, ctx, schema, "orders", 1)
+	bumped := topicActivity(t, ctx, schema, "orders")
+	assert.WithinDuration(t, time.Now(), bumped, time.Minute, "an insert past the gate window must bump last_inserted_at")
 }
