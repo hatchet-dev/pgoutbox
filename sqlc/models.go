@@ -9,6 +9,12 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type ConsumerSession struct {
+	ConsumerID                 uuid.UUID          `json:"consumer_id"`
+	ExpiresAt                  pgtype.Timestamptz `json:"expires_at"`
+	MaintainsDefaultExpiration bool               `json:"maintains_default_expiration"`
+}
+
 type MaintenanceLease struct {
 	Topic      string             `json:"topic"`
 	HolderID   uuid.UUID          `json:"holder_id"`
@@ -27,4 +33,5 @@ type Topic struct {
 	ExpirationNanos            pgtype.Int8        `json:"expiration_nanos"`
 	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
 	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
+	LastInsertedAt             pgtype.Timestamptz `json:"last_inserted_at"`
 }

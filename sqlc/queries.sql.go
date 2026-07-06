@@ -53,6 +53,118 @@ func (q *Queries) AcquireMessagesByTopic(ctx context.Context, db DBTX, arg Acqui
 	return items, nil
 }
 
+const bumpTopicActivityIfStale = `-- name: BumpTopicActivityIfStale :exec
+UPDATE /*tmpl*/ topics /*tmpl*/
+SET last_inserted_at = now()
+WHERE topic = $1
+  AND (last_inserted_at IS NULL OR last_inserted_at < now() - interval '30 seconds')
+`
+
+// Flush-path counterpart of the insert trigger's activity bump. The trigger
+// bumps with FOR UPDATE SKIP LOCKED, and ProcessMessages holds the topic row
+// lock for its whole transaction — so on a continuously-processed topic the
+// trigger can be starved out of every bump. The flush transaction already
+// holds that lock, so it compensates by bumping here after processing
+// messages, gated to the same 30-second granularity as the trigger.
+func (q *Queries) BumpTopicActivityIfStale(ctx context.Context, db DBTX, topic string) error {
+	_, err := db.Exec(ctx, bumpTopicActivityIfStale, topic)
+	return err
+}
+
+const claimMaintenanceLeases = `-- name: ClaimMaintenanceLeases :many
+WITH sessions AS MATERIALIZED (
+    SELECT consumer_id, (expires_at < now())::boolean AS expired
+    FROM /*tmpl*/ consumer_sessions /*tmpl*/
+),
+claimable AS (
+    SELECT l.topic
+    FROM /*tmpl*/ maintenance_leases /*tmpl*/ l
+    LEFT JOIN sessions s ON s.consumer_id = l.holder_id
+    WHERE l.topic = ANY($2::text[])
+      AND COALESCE(s.expired, l.acquired_at < $3::timestamptz)
+    FOR UPDATE OF l SKIP LOCKED
+)
+UPDATE /*tmpl*/ maintenance_leases /*tmpl*/ l
+SET holder_id = $1::uuid, acquired_at = now()
+FROM claimable c
+WHERE l.topic = c.topic
+RETURNING l.topic
+`
+
+type ClaimMaintenanceLeasesParams struct {
+	HolderID    uuid.UUID          `json:"holder_id"`
+	Topics      []string           `json:"topics"`
+	StaleCutoff pgtype.Timestamptz `json:"stale_cutoff"`
+}
+
+// Takeover path for lease rows whose holder is gone: its session lapsed, or
+// (pre-session holder) its acquired_at went stale. SKIP LOCKED lets racing
+// claimants skip contested rows instead of queueing; the loser claims other
+// topics on its next scan. consumer_sessions (the small side, kept small by
+// the retention sweep) is narrowed once into a MATERIALIZED CTE so the
+// planner hashes it instead of choosing its own join shape against
+// maintenance_leases.
+func (q *Queries) ClaimMaintenanceLeases(ctx context.Context, db DBTX, arg ClaimMaintenanceLeasesParams) ([]string, error) {
+	rows, err := db.Query(ctx, claimMaintenanceLeases, arg.HolderID, arg.Topics, arg.StaleCutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var topic string
+		if err := rows.Scan(&topic); err != nil {
+			return nil, err
+		}
+		items = append(items, topic)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const countLiveConsumerSessions = `-- name: CountLiveConsumerSessions :one
+SELECT
+    COUNT(*) AS live,
+    COUNT(*) FILTER (WHERE maintains_default_expiration) AS default_maintainers
+FROM /*tmpl*/ consumer_sessions /*tmpl*/
+WHERE expires_at > now()
+`
+
+type CountLiveConsumerSessionsRow struct {
+	Live               int64 `json:"live"`
+	DefaultMaintainers int64 `json:"default_maintainers"`
+}
+
+// Two fair-share denominators: every live instance can maintain topics with
+// an explicit TTL, but only instances configured with a default expiration
+// can even see default-TTL topics as candidates — dividing those by the
+// total would leave most of a default-TTL backlog to the floor-of-1
+// trickle.
+func (q *Queries) CountLiveConsumerSessions(ctx context.Context, db DBTX) (*CountLiveConsumerSessionsRow, error) {
+	row := db.QueryRow(ctx, countLiveConsumerSessions)
+	var i CountLiveConsumerSessionsRow
+	err := row.Scan(&i.Live, &i.DefaultMaintainers)
+	return &i, err
+}
+
+const deleteExpiredConsumerSessions = `-- name: DeleteExpiredConsumerSessions :exec
+DELETE FROM /*tmpl*/ consumer_sessions /*tmpl*/
+WHERE expires_at < $1::timestamptz
+`
+
+// GC for session rows left behind by dead instances (one per process
+// lifetime, since instance ids are per-NewOutbox). Bounding the table keeps
+// CountLiveConsumerSessions and the lease-liveness joins on a small seq scan.
+// Deleting a row is equivalent to it being expired, so the cutoff buffer is
+// caution, not correctness; a live instance wrongly swept just re-inserts
+// itself on its next heartbeat.
+func (q *Queries) DeleteExpiredConsumerSessions(ctx context.Context, db DBTX, cutoff pgtype.Timestamptz) error {
+	_, err := db.Exec(ctx, deleteExpiredConsumerSessions, cutoff)
+	return err
+}
+
 const deleteExpiredMessages = `-- name: DeleteExpiredMessages :exec
 DELETE FROM /*tmpl*/ messages /*tmpl*/
 WHERE topic = $1 AND inserted_at < $2
@@ -85,25 +197,75 @@ func (q *Queries) DeleteMessagesByIds(ctx context.Context, db DBTX, arg DeleteMe
 	return err
 }
 
-const getAllTopics = `-- name: GetAllTopics :many
-SELECT topic, expiration_nanos, exclusive_consumer_id, exclusive_consumer_expires_at
-FROM /*tmpl*/ topics /*tmpl*/
+const getMaintenanceCandidateTopics = `-- name: GetMaintenanceCandidateTopics :many
+WITH sessions AS MATERIALIZED (
+    SELECT consumer_id, (expires_at < now())::boolean AS expired
+    FROM /*tmpl*/ consumer_sessions /*tmpl*/
+)
+SELECT
+    t.topic,
+    t.expiration_nanos,
+    COALESCE(l.holder_id = $1::uuid, false)::boolean AS held_by_me,
+    (l.topic IS NULL)::boolean AS unleased,
+    COALESCE(s.expired, l.acquired_at < $2::timestamptz, true)::boolean AS lease_expired
+FROM /*tmpl*/ topics /*tmpl*/ t
+LEFT JOIN /*tmpl*/ maintenance_leases /*tmpl*/ l ON l.topic = t.topic
+LEFT JOIN sessions s ON s.consumer_id = l.holder_id
+WHERE COALESCE(t.expiration_nanos, $3::bigint, 0) > 0
+  AND (
+    t.topic = ANY($4::text[])
+    OR t.last_inserted_at IS NULL
+    OR extract(epoch FROM (now() - t.last_inserted_at)) < COALESCE(t.expiration_nanos, $3::bigint)::float8 / 1e9 + $5::float8
+  )
 `
 
-func (q *Queries) GetAllTopics(ctx context.Context, db DBTX) ([]*Topic, error) {
-	rows, err := db.Query(ctx, getAllTopics)
+type GetMaintenanceCandidateTopicsParams struct {
+	HolderID               uuid.UUID          `json:"holder_id"`
+	StaleCutoff            pgtype.Timestamptz `json:"stale_cutoff"`
+	DefaultExpirationNanos pgtype.Int8        `json:"default_expiration_nanos"`
+	IncludeTopics          []string           `json:"include_topics"`
+	SlackSeconds           float64            `json:"slack_seconds"`
+}
+
+type GetMaintenanceCandidateTopicsRow struct {
+	Topic           string      `json:"topic"`
+	ExpirationNanos pgtype.Int8 `json:"expiration_nanos"`
+	HeldByMe        bool        `json:"held_by_me"`
+	Unleased        bool        `json:"unleased"`
+	LeaseExpired    bool        `json:"lease_expired"`
+}
+
+// Topics that may still hold unexpired messages (last insert newer than
+// TTL + slack; NULL activity is treated as active, belt-and-braces for rows
+// that predate the column), plus any topics force-included by the catch-up
+// sweep, together with their maintenance-lease state. Lease liveness defers
+// to the holder's consumer session, falling back to the staleness cutoff for
+// pre-session holders (see SelectMaintenanceLeaseForUpdate). The plan is
+// pinned to a deliberate shape: one seq scan of topics (the activity
+// predicate is unindexable by design), maintenance_leases joined on its
+// primary key, and consumer_sessions — the small side, kept small by the
+// retention sweep — narrowed once into a MATERIALIZED CTE and hashed.
+func (q *Queries) GetMaintenanceCandidateTopics(ctx context.Context, db DBTX, arg GetMaintenanceCandidateTopicsParams) ([]*GetMaintenanceCandidateTopicsRow, error) {
+	rows, err := db.Query(ctx, getMaintenanceCandidateTopics,
+		arg.HolderID,
+		arg.StaleCutoff,
+		arg.DefaultExpirationNanos,
+		arg.IncludeTopics,
+		arg.SlackSeconds,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []*Topic
+	var items []*GetMaintenanceCandidateTopicsRow
 	for rows.Next() {
-		var i Topic
+		var i GetMaintenanceCandidateTopicsRow
 		if err := rows.Scan(
 			&i.Topic,
 			&i.ExpirationNanos,
-			&i.ExclusiveConsumerID,
-			&i.ExclusiveConsumerExpiresAt,
+			&i.HeldByMe,
+			&i.Unleased,
+			&i.LeaseExpired,
 		); err != nil {
 			return nil, err
 		}
@@ -130,10 +292,13 @@ func (q *Queries) GetOldestMessageInsertedAt(ctx context.Context, db DBTX, topic
 }
 
 const getTopicForUpdate = `-- name: GetTopicForUpdate :one
-SELECT exclusive_consumer_id, exclusive_consumer_expires_at
-FROM /*tmpl*/ topics /*tmpl*/
-WHERE topic = $1
-FOR UPDATE
+SELECT
+    t.exclusive_consumer_id,
+    COALESCE(t.exclusive_consumer_expires_at, s.expires_at) AS exclusive_consumer_expires_at
+FROM /*tmpl*/ topics /*tmpl*/ t
+LEFT JOIN /*tmpl*/ consumer_sessions /*tmpl*/ s ON s.consumer_id = t.exclusive_consumer_id
+WHERE t.topic = $1
+FOR UPDATE OF t
 `
 
 type GetTopicForUpdateRow struct {
@@ -141,6 +306,11 @@ type GetTopicForUpdateRow struct {
 	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
 }
 
+// A NULL exclusive_consumer_expires_at on the topics row means "defer to the
+// holder's consumer session for liveness"; a non-NULL value is a per-topic
+// override (release, grace-period expiry, or a lease written by a pre-session
+// version of pgoutbox) and wins the COALESCE. FOR UPDATE OF t locks only the
+// topics row, not the joined session row shared by every topic the holder owns.
 func (q *Queries) GetTopicForUpdate(ctx context.Context, db DBTX, topic string) (*GetTopicForUpdateRow, error) {
 	row := db.QueryRow(ctx, getTopicForUpdate, topic)
 	var i GetTopicForUpdateRow
@@ -154,15 +324,22 @@ FROM /*tmpl*/ topics /*tmpl*/
 WHERE expiration_nanos IS NOT NULL
 `
 
-func (q *Queries) GetTopicsWithExpiration(ctx context.Context, db DBTX) ([]*Topic, error) {
+type GetTopicsWithExpirationRow struct {
+	Topic                      string             `json:"topic"`
+	ExpirationNanos            pgtype.Int8        `json:"expiration_nanos"`
+	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
+	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
+}
+
+func (q *Queries) GetTopicsWithExpiration(ctx context.Context, db DBTX) ([]*GetTopicsWithExpirationRow, error) {
 	rows, err := db.Query(ctx, getTopicsWithExpiration)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []*Topic
+	var items []*GetTopicsWithExpirationRow
 	for rows.Next() {
-		var i Topic
+		var i GetTopicsWithExpirationRow
 		if err := rows.Scan(
 			&i.Topic,
 			&i.ExpirationNanos,
@@ -172,6 +349,45 @@ func (q *Queries) GetTopicsWithExpiration(ctx context.Context, db DBTX) ([]*Topi
 			return nil, err
 		}
 		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getTopicsWithMessages = `-- name: GetTopicsWithMessages :many
+WITH RECURSIVE tops AS (
+    (SELECT topic FROM /*tmpl*/ messages /*tmpl*/ ORDER BY topic LIMIT 1)
+    UNION ALL
+    SELECT (
+        SELECT m.topic FROM /*tmpl*/ messages /*tmpl*/ m
+        WHERE m.topic > tops.topic
+        ORDER BY m.topic
+        LIMIT 1
+    )
+    FROM tops
+    WHERE tops.topic IS NOT NULL
+)
+SELECT topic::text AS topic FROM tops WHERE topic IS NOT NULL
+`
+
+// Loose index scan emulated over the (topic, id) PK: O(distinct topics)
+// index probes the planner cannot degrade to a seq scan of messages. Used by
+// the catch-up sweep to find topics holding messages regardless of activity.
+func (q *Queries) GetTopicsWithMessages(ctx context.Context, db DBTX) ([]string, error) {
+	rows, err := db.Query(ctx, getTopicsWithMessages)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var topic string
+		if err := rows.Scan(&topic); err != nil {
+			return nil, err
+		}
+		items = append(items, topic)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -195,14 +411,49 @@ func (q *Queries) InsertMaintenanceLeaseIfAbsent(ctx context.Context, db DBTX, a
 	return err
 }
 
+const insertMaintenanceLeases = `-- name: InsertMaintenanceLeases :many
+INSERT INTO /*tmpl*/ maintenance_leases /*tmpl*/ (topic, holder_id)
+SELECT unnest($1::text[]), $2::uuid
+ON CONFLICT (topic) DO NOTHING
+RETURNING topic
+`
+
+type InsertMaintenanceLeasesParams struct {
+	Topics   []string  `json:"topics"`
+	HolderID uuid.UUID `json:"holder_id"`
+}
+
+// Claim path for topics that have no lease row yet. RETURNING reports the
+// subset this instance actually won; a concurrent instance may have inserted
+// a row first, in which case the conflict arm drops that topic silently.
+func (q *Queries) InsertMaintenanceLeases(ctx context.Context, db DBTX, arg InsertMaintenanceLeasesParams) ([]string, error) {
+	rows, err := db.Query(ctx, insertMaintenanceLeases, arg.Topics, arg.HolderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var topic string
+		if err := rows.Scan(&topic); err != nil {
+			return nil, err
+		}
+		items = append(items, topic)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 type InsertMessageParams struct {
 	Topic   string `json:"topic"`
 	Payload []byte `json:"payload"`
 }
 
 const insertTopicIfAbsent = `-- name: InsertTopicIfAbsent :exec
-INSERT INTO /*tmpl*/ topics /*tmpl*/ (topic, expiration_nanos)
-VALUES ($1, $2)
+INSERT INTO /*tmpl*/ topics /*tmpl*/ (topic, expiration_nanos, last_inserted_at)
+VALUES ($1, $2, now())
 ON CONFLICT (topic) DO UPDATE
 SET expiration_nanos = COALESCE(topics.expiration_nanos, EXCLUDED.expiration_nanos)
 `
@@ -214,6 +465,23 @@ type InsertTopicIfAbsentParams struct {
 
 func (q *Queries) InsertTopicIfAbsent(ctx context.Context, db DBTX, arg InsertTopicIfAbsentParams) error {
 	_, err := db.Exec(ctx, insertTopicIfAbsent, arg.Topic, arg.ExpirationNanos)
+	return err
+}
+
+const releaseMaintenanceLease = `-- name: ReleaseMaintenanceLease :exec
+DELETE FROM /*tmpl*/ maintenance_leases /*tmpl*/
+WHERE topic = $1 AND holder_id = $2
+`
+
+type ReleaseMaintenanceLeaseParams struct {
+	Topic    string    `json:"topic"`
+	HolderID uuid.UUID `json:"holder_id"`
+}
+
+// Dormancy release: dormant topics carry no lease row at all. Guarded by
+// holder so a lease that was concurrently taken over is never deleted.
+func (q *Queries) ReleaseMaintenanceLease(ctx context.Context, db DBTX, arg ReleaseMaintenanceLeaseParams) error {
+	_, err := db.Exec(ctx, releaseMaintenanceLease, arg.Topic, arg.HolderID)
 	return err
 }
 
@@ -235,21 +503,34 @@ func (q *Queries) RenewTopicExclusiveConsumer(ctx context.Context, db DBTX, arg 
 }
 
 const selectMaintenanceLeaseForUpdate = `-- name: SelectMaintenanceLeaseForUpdate :one
-SELECT holder_id, acquired_at
-FROM /*tmpl*/ maintenance_leases /*tmpl*/
-WHERE topic = $1
-FOR UPDATE
+SELECT
+    l.holder_id,
+    COALESCE(s.expires_at < now(), l.acquired_at < $1::timestamptz, true)::boolean AS lease_expired
+FROM /*tmpl*/ maintenance_leases /*tmpl*/ l
+LEFT JOIN /*tmpl*/ consumer_sessions /*tmpl*/ s ON s.consumer_id = l.holder_id
+WHERE l.topic = $2
+FOR UPDATE OF l
 `
 
-type SelectMaintenanceLeaseForUpdateRow struct {
-	HolderID   uuid.UUID          `json:"holder_id"`
-	AcquiredAt pgtype.Timestamptz `json:"acquired_at"`
+type SelectMaintenanceLeaseForUpdateParams struct {
+	StaleCutoff pgtype.Timestamptz `json:"stale_cutoff"`
+	Topic       string             `json:"topic"`
 }
 
-func (q *Queries) SelectMaintenanceLeaseForUpdate(ctx context.Context, db DBTX, topic string) (*SelectMaintenanceLeaseForUpdateRow, error) {
-	row := db.QueryRow(ctx, selectMaintenanceLeaseForUpdate, topic)
+type SelectMaintenanceLeaseForUpdateRow struct {
+	HolderID     uuid.UUID `json:"holder_id"`
+	LeaseExpired bool      `json:"lease_expired"`
+}
+
+// Lease liveness defers to the holder's consumer session; a holder with no
+// session row (written by a pre-session version of pgoutbox) is judged by
+// acquired_at against the caller-computed staleness cutoff, exactly the rule
+// that version applies to itself. FOR UPDATE OF l leaves the session row
+// unlocked, since every other lease held by the same instance reads it too.
+func (q *Queries) SelectMaintenanceLeaseForUpdate(ctx context.Context, db DBTX, arg SelectMaintenanceLeaseForUpdateParams) (*SelectMaintenanceLeaseForUpdateRow, error) {
+	row := db.QueryRow(ctx, selectMaintenanceLeaseForUpdate, arg.StaleCutoff, arg.Topic)
 	var i SelectMaintenanceLeaseForUpdateRow
-	err := row.Scan(&i.HolderID, &i.AcquiredAt)
+	err := row.Scan(&i.HolderID, &i.LeaseExpired)
 	return &i, err
 }
 
@@ -284,5 +565,24 @@ type UpdateMaintenanceLeaseParams struct {
 
 func (q *Queries) UpdateMaintenanceLease(ctx context.Context, db DBTX, arg UpdateMaintenanceLeaseParams) error {
 	_, err := db.Exec(ctx, updateMaintenanceLease, arg.Topic, arg.HolderID)
+	return err
+}
+
+const upsertConsumerSession = `-- name: UpsertConsumerSession :exec
+INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)
+VALUES ($1, $2, $3)
+ON CONFLICT (consumer_id) DO UPDATE
+SET expires_at = EXCLUDED.expires_at,
+    maintains_default_expiration = EXCLUDED.maintains_default_expiration
+`
+
+type UpsertConsumerSessionParams struct {
+	ConsumerID                 uuid.UUID          `json:"consumer_id"`
+	ExpiresAt                  pgtype.Timestamptz `json:"expires_at"`
+	MaintainsDefaultExpiration bool               `json:"maintains_default_expiration"`
+}
+
+func (q *Queries) UpsertConsumerSession(ctx context.Context, db DBTX, arg UpsertConsumerSessionParams) error {
+	_, err := db.Exec(ctx, upsertConsumerSession, arg.ConsumerID, arg.ExpiresAt, arg.MaintainsDefaultExpiration)
 	return err
 }
