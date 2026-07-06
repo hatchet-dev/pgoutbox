@@ -377,12 +377,17 @@ func (o *outboxImpl) AcquireTopic(ctx context.Context, topic string) error {
 	// if it landed after the acquire below. Stop suppresses that write when
 	// it wins the race, and when it loses (the old ctx ended first) it blocks
 	// until the in-flight write has finished — either way the acquire always
-	// has the last word.
-	o.exclusiveLeaseWatcher.Stop(topic)
+	// has the last word. Stopping the watcher makes its expiry duty ours: if
+	// we fail before installing a replacement, the old lease would stay
+	// session-deferred forever with nothing left to expire it (the heartbeat
+	// keeps the session fresh for the life of the process), so every failure
+	// return below must write the expiry the watcher no longer will.
+	stopped := o.exclusiveLeaseWatcher.Stop(topic)
 
 	for {
 		acquired, err := o.tryAcquireTopicLease(ctx, topic)
 		if err != nil {
+			o.expireLeaseIfWatcherOrphaned(ctx, topic, stopped)
 			return err
 		}
 		if acquired {
@@ -391,10 +396,26 @@ func (o *outboxImpl) AcquireTopic(ctx context.Context, topic string) error {
 		}
 		select {
 		case <-ctx.Done():
+			o.expireLeaseIfWatcherOrphaned(ctx, topic, stopped)
 			return ctx.Err()
 		case <-time.After(exclusiveLeaseRetryInterval.Load()):
 		}
 	}
+}
+
+// expireLeaseIfWatcherOrphaned writes the grace-period expiry for a lease
+// whose watcher was stopped but never replaced — the failure paths of
+// AcquireTopic and ReleaseTopic. It restores the pre-session behavior of "the
+// last timestamp lapses naturally" for a hold the caller just walked away
+// from. Detached ctx because the caller's ctx being cancelled is the most
+// common way to land here; if even the detached write fails, the instance's
+// heartbeat is failing against the same database, so the session itself
+// lapses and takes the lease with it.
+func (o *outboxImpl) expireLeaseIfWatcherOrphaned(ctx context.Context, topic string, hadWatcher bool) {
+	if !hadWatcher {
+		return
+	}
+	o.expireExclusiveLeaseAfterGrace(context.WithoutCancel(ctx), topic)
 }
 
 // ReleaseTopic stops this instance's lease renewer for topic and expires the
@@ -407,7 +428,7 @@ func (o *outboxImpl) ReleaseTopic(ctx context.Context, topic string) error {
 		return fmt.Errorf("topic must not be empty")
 	}
 
-	o.exclusiveLeaseWatcher.Stop(topic)
+	stopped := o.exclusiveLeaseWatcher.Stop(topic)
 
 	expiredAt := time.Now().UTC().Add(-time.Second)
 	err := o.queries.RenewTopicExclusiveConsumer(ctx, dbwrap.New(o.pool, o.schema), sqlc.RenewTopicExclusiveConsumerParams{
@@ -416,6 +437,11 @@ func (o *outboxImpl) ReleaseTopic(ctx context.Context, topic string) error {
 		ExclusiveConsumerExpiresAt: pgtype.Timestamptz{Time: expiredAt, Valid: true},
 	})
 	if err != nil {
+		// The stopped watcher will never fire and the release write didn't
+		// land (typically: caller ctx already cancelled) — without this the
+		// lease would ride the session heartbeat forever. Degrades a failed
+		// immediate release into a natural grace-period lapse.
+		o.expireLeaseIfWatcherOrphaned(ctx, topic, stopped)
 		return fmt.Errorf("release exclusive lease for topic %q: %w", topic, err)
 	}
 	return nil
@@ -508,8 +534,9 @@ func (o *outboxImpl) upsertConsumerSession(ctx context.Context) error {
 func (o *outboxImpl) upsertConsumerSessionIn(ctx context.Context, wrapped *dbwrap.Wrapper) error {
 	expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration.Load())
 	return o.queries.UpsertConsumerSession(ctx, wrapped, sqlc.UpsertConsumerSessionParams{
-		ConsumerID: o.instanceID,
-		ExpiresAt:  pgtype.Timestamptz{Time: expiresAt, Valid: true},
+		ConsumerID:                 o.instanceID,
+		ExpiresAt:                  pgtype.Timestamptz{Time: expiresAt, Valid: true},
+		MaintainsDefaultExpiration: o.defaultExpiration > 0,
 	})
 }
 
@@ -747,66 +774,97 @@ func (o *outboxImpl) scanTopics(ctx context.Context, lastCatchup time.Time) time
 	}
 
 	ttls := make(map[string]time.Duration, len(candidates))
-	var held, claimNew, claimStale []string
+	var held []string
+	var explicit, dflt claimClass
 	for _, c := range candidates {
 		ttl := o.defaultExpiration
+		class := &dflt
 		if c.ExpirationNanos.Valid {
 			ttl = time.Duration(c.ExpirationNanos.Int64)
+			class = &explicit
 		}
 		if ttl <= 0 {
 			continue
 		}
 		ttls[c.Topic] = ttl
+		class.candidates++
 		switch {
 		case c.HeldByMe:
+			class.held++
 			held = append(held, c.Topic)
 		case c.Unleased:
-			claimNew = append(claimNew, c.Topic)
+			class.unleased = append(class.unleased, c.Topic)
 		case c.LeaseExpired:
-			claimStale = append(claimStale, c.Topic)
+			class.stale = append(class.stale, c.Topic)
 		}
 	}
 
-	held = append(held, o.claimTopics(ctx, wrapped, len(ttls), len(held), claimNew, claimStale)...)
+	held = append(held, o.claimTopics(ctx, wrapped, &explicit, &dflt)...)
 
 	o.reconcileLoops(ctx, ttls, held)
 	return lastCatchup
 }
 
-// claimTopics claims up to this instance's fair share (ceil(candidates /
-// live sessions)) of the claimable topics, in random order so concurrently
-// scanning instances spread across the set instead of contending on the same
-// prefix. Returns the topics actually won; claims lost to SKIP LOCKED or the
-// insert conflict arm simply come back around on a later scan.
-func (o *outboxImpl) claimTopics(ctx context.Context, wrapped *dbwrap.Wrapper, candidates, held int, claimNew, claimStale []string) []string {
-	if len(claimNew)+len(claimStale) == 0 {
+// claimClass groups one scanner tick's claim state for one fair-share class
+// of topics. The classes exist because eligibility differs: topics with an
+// explicit TTL (expiration_nanos in the DB) are claimable by every live
+// instance, while default-TTL topics are only visible to instances
+// configured with WithDefaultExpiration — dividing those by the total live
+// count would leave most of a default-TTL backlog to the floor-of-1 trickle
+// whenever producer-/process-only instances outnumber the maintainers.
+type claimClass struct {
+	candidates int      // candidate topics in this class this tick
+	held       int      // of those, already held by this instance
+	unleased   []string // claimable: no lease row yet
+	stale      []string // claimable: lease row whose holder is gone
+}
+
+// claimTopics claims up to this instance's fair share of the claimable
+// topics in each class, dividing explicit-TTL candidates by all live
+// sessions and default-TTL candidates by the sessions flagged as default
+// maintainers. Returns the topics actually won.
+func (o *outboxImpl) claimTopics(ctx context.Context, wrapped *dbwrap.Wrapper, explicit, dflt *claimClass) []string {
+	if len(explicit.unleased)+len(explicit.stale)+len(dflt.unleased)+len(dflt.stale) == 0 {
 		return nil
 	}
 
-	live, err := o.queries.CountLiveConsumerSessions(ctx, wrapped)
+	counts, err := o.queries.CountLiveConsumerSessions(ctx, wrapped)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
 			o.logger.Error().Err(err).Msg("maintenance: failed to count live consumer sessions")
 		}
 		return nil
 	}
-	if live < 1 {
-		live = 1
+
+	won := o.claimClassShare(ctx, wrapped, explicit, counts.Live)
+	return append(won, o.claimClassShare(ctx, wrapped, dflt, counts.DefaultMaintainers)...)
+}
+
+// claimClassShare claims up to ceil(candidates/instances) - held of one
+// class's claimable topics, in random order so concurrently scanning
+// instances spread across the set instead of contending on the same prefix.
+// The fair-share cap spreads load; it is not a correctness constraint. The
+// floor of 1 keeps claimable topics from being stranded (e.g. this
+// instance's own session row hasn't landed yet, so the class denominator
+// under-counts). Claims lost to SKIP LOCKED or the insert conflict arm
+// simply come back around on a later scan.
+func (o *outboxImpl) claimClassShare(ctx context.Context, wrapped *dbwrap.Wrapper, class *claimClass, instances int64) []string {
+	if len(class.unleased)+len(class.stale) == 0 {
+		return nil
+	}
+	if instances < 1 {
+		instances = 1
 	}
 
-	// The fair-share cap spreads load; it is not a correctness constraint. The
-	// floor of 1 keeps claimable topics from being stranded: this instance may
-	// be the only one whose configuration (e.g. WithDefaultExpiration) makes
-	// it eligible to maintain them, and the live-session count cannot see that.
-	budget := max((candidates+int(live)-1)/int(live)-held, 1)
+	budget := max((class.candidates+int(instances)-1)/int(instances)-class.held, 1)
 
-	rand.Shuffle(len(claimNew), func(i, j int) { claimNew[i], claimNew[j] = claimNew[j], claimNew[i] })
-	rand.Shuffle(len(claimStale), func(i, j int) { claimStale[i], claimStale[j] = claimStale[j], claimStale[i] })
+	rand.Shuffle(len(class.unleased), func(i, j int) { class.unleased[i], class.unleased[j] = class.unleased[j], class.unleased[i] })
+	rand.Shuffle(len(class.stale), func(i, j int) { class.stale[i], class.stale[j] = class.stale[j], class.stale[i] })
 
 	var won []string
-	if len(claimNew) > 0 {
+	if len(class.unleased) > 0 {
 		topics, err := o.queries.InsertMaintenanceLeases(ctx, wrapped, sqlc.InsertMaintenanceLeasesParams{
-			Topics:   claimNew[:min(budget, len(claimNew))],
+			Topics:   class.unleased[:min(budget, len(class.unleased))],
 			HolderID: o.instanceID,
 		})
 		if err != nil {
@@ -818,9 +876,9 @@ func (o *outboxImpl) claimTopics(ctx context.Context, wrapped *dbwrap.Wrapper, c
 			budget -= len(topics)
 		}
 	}
-	if budget > 0 && len(claimStale) > 0 {
+	if budget > 0 && len(class.stale) > 0 {
 		topics, err := o.queries.ClaimMaintenanceLeases(ctx, wrapped, sqlc.ClaimMaintenanceLeasesParams{
-			Topics:      claimStale[:min(budget, len(claimStale))],
+			Topics:      class.stale[:min(budget, len(class.stale))],
 			HolderID:    o.instanceID,
 			StaleCutoff: pgtype.Timestamptz{Time: time.Now().UTC().Add(-maintenanceLeaseTimeout.Load()), Valid: true},
 		})

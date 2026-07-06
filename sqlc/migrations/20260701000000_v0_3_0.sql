@@ -1,8 +1,14 @@
 -- +goose Up
 -- +goose StatementBegin
 CREATE TABLE consumer_sessions (
-    consumer_id UUID        NOT NULL,
-    expires_at  TIMESTAMPTZ NOT NULL,
+    consumer_id                  UUID        NOT NULL,
+    expires_at                   TIMESTAMPTZ NOT NULL,
+    -- Whether this instance is configured with a default expiration and can
+    -- therefore maintain topics that have no explicit TTL of their own. Used
+    -- to size the maintenance fair-share denominator per topic class, so
+    -- producer-/process-only instances don't dilute the claim budget for
+    -- default-TTL topics they will never claim.
+    maintains_default_expiration BOOLEAN     NOT NULL DEFAULT FALSE,
     CONSTRAINT consumer_sessions_pkey PRIMARY KEY (consumer_id)
 );
 

@@ -125,16 +125,28 @@ func (q *Queries) ClaimMaintenanceLeases(ctx context.Context, db DBTX, arg Claim
 }
 
 const countLiveConsumerSessions = `-- name: CountLiveConsumerSessions :one
-SELECT COUNT(*)
+SELECT
+    COUNT(*) AS live,
+    COUNT(*) FILTER (WHERE maintains_default_expiration) AS default_maintainers
 FROM /*tmpl*/ consumer_sessions /*tmpl*/
 WHERE expires_at > now()
 `
 
-func (q *Queries) CountLiveConsumerSessions(ctx context.Context, db DBTX) (int64, error) {
+type CountLiveConsumerSessionsRow struct {
+	Live               int64 `json:"live"`
+	DefaultMaintainers int64 `json:"default_maintainers"`
+}
+
+// Two fair-share denominators: every live instance can maintain topics with
+// an explicit TTL, but only instances configured with a default expiration
+// can even see default-TTL topics as candidates — dividing those by the
+// total would leave most of a default-TTL backlog to the floor-of-1
+// trickle.
+func (q *Queries) CountLiveConsumerSessions(ctx context.Context, db DBTX) (*CountLiveConsumerSessionsRow, error) {
 	row := db.QueryRow(ctx, countLiveConsumerSessions)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
+	var i CountLiveConsumerSessionsRow
+	err := row.Scan(&i.Live, &i.DefaultMaintainers)
+	return &i, err
 }
 
 const deleteExpiredConsumerSessions = `-- name: DeleteExpiredConsumerSessions :exec
@@ -557,18 +569,20 @@ func (q *Queries) UpdateMaintenanceLease(ctx context.Context, db DBTX, arg Updat
 }
 
 const upsertConsumerSession = `-- name: UpsertConsumerSession :exec
-INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at)
-VALUES ($1, $2)
+INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)
+VALUES ($1, $2, $3)
 ON CONFLICT (consumer_id) DO UPDATE
-SET expires_at = EXCLUDED.expires_at
+SET expires_at = EXCLUDED.expires_at,
+    maintains_default_expiration = EXCLUDED.maintains_default_expiration
 `
 
 type UpsertConsumerSessionParams struct {
-	ConsumerID uuid.UUID          `json:"consumer_id"`
-	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	ConsumerID                 uuid.UUID          `json:"consumer_id"`
+	ExpiresAt                  pgtype.Timestamptz `json:"expires_at"`
+	MaintainsDefaultExpiration bool               `json:"maintains_default_expiration"`
 }
 
 func (q *Queries) UpsertConsumerSession(ctx context.Context, db DBTX, arg UpsertConsumerSessionParams) error {
-	_, err := db.Exec(ctx, upsertConsumerSession, arg.ConsumerID, arg.ExpiresAt)
+	_, err := db.Exec(ctx, upsertConsumerSession, arg.ConsumerID, arg.ExpiresAt, arg.MaintainsDefaultExpiration)
 	return err
 }

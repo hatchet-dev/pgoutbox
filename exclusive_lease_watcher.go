@@ -81,15 +81,21 @@ func (w *leaseWatcher) Start(ctx context.Context, topic string) {
 }
 
 // Stop cancels topic's watcher goroutine, if one is running, suppresses its
-// onCancel, and blocks until it has exited. It is a no-op if no watcher is
+// onCancel, and blocks until it has exited. It reports whether a watcher was
+// actually stopped: false means there was nothing to stop — no watcher was
 // running for topic, including when one was running but has already fired on
 // its own (e.g. because the ctx passed to Start was cancelled externally).
-func (w *leaseWatcher) Stop(topic string) {
+// Callers use that report to know the expiry responsibility the watcher
+// carried is now theirs: a stopped watcher will never fire, so whoever
+// stopped it must either install replacement lease state or write the expiry
+// themselves.
+func (w *leaseWatcher) Stop(topic string) bool {
 	v, ok := w.running.LoadAndDelete(topic)
 	if !ok {
-		return
+		return false
 	}
 	handle := v.(*leaseWatcherHandle)
 	handle.cancel(errLeaseWatcherStopped)
 	<-handle.done
+	return true
 }

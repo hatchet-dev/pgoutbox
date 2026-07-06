@@ -248,7 +248,7 @@ func TestExpiry_LeaseExclusion(t *testing.T) {
 }
 
 func TestExpiry_LeaseHandoff(t *testing.T) {
-	t.Parallel()
+	// No t.Parallel() — modifies global timing vars shared with other tests.
 
 	// Maintenance leases defer to the holder's consumer session for liveness,
 	// so failover is driven by the dead instance's session lapsing: shorten
@@ -322,7 +322,7 @@ func TestExpiry_NoExpirationsIsNoop(t *testing.T) {
 }
 
 func TestExpiry_DefaultExpiration(t *testing.T) {
-	t.Parallel()
+	// No t.Parallel() — modifies global timing vars shared with other tests.
 
 	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
 	defer restoreScan()
@@ -360,7 +360,7 @@ func TestExpiry_DefaultExpiration(t *testing.T) {
 }
 
 func TestExpiry_MultiTopicDifferentTTLs(t *testing.T) {
-	t.Parallel()
+	// No t.Parallel() — modifies global timing vars shared with other tests.
 
 	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
 	defer restoreScan()
@@ -395,7 +395,7 @@ func TestExpiry_MultiTopicDifferentTTLs(t *testing.T) {
 }
 
 func TestExpiry_DormantTopicReleasesLeaseAndRevives(t *testing.T) {
-	t.Parallel()
+	// No t.Parallel() — modifies global timing vars shared with other tests.
 
 	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
 	defer restoreScan()
@@ -445,7 +445,7 @@ func TestExpiry_DormantTopicReleasesLeaseAndRevives(t *testing.T) {
 }
 
 func TestExpiry_MaintenanceFederatesAcrossInstances(t *testing.T) {
-	t.Parallel()
+	// No t.Parallel() — modifies global timing vars shared with other tests.
 
 	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
 	defer restoreScan()
@@ -481,7 +481,7 @@ func TestExpiry_MaintenanceFederatesAcrossInstances(t *testing.T) {
 }
 
 func TestExpiry_CatchupSweepCleansOrphanedTopic(t *testing.T) {
-	t.Parallel()
+	// No t.Parallel() — modifies global timing vars shared with other tests.
 
 	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
 	defer restoreScan()
@@ -520,6 +520,54 @@ func TestExpiry_CatchupSweepCleansOrphanedTopic(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return !hasMaintenanceLease(t, ctx, schema, "orders")
 	}, 10*time.Second, 25*time.Millisecond, "the drained topic should release its lease row")
+}
+
+// TestExpiry_DefaultTopicsFairShareIgnoresIneligibleSessions: every NewOutbox
+// registers a live consumer session, but only instances configured with a
+// default expiration can see default-TTL topics as maintenance candidates.
+// The fair-share denominator for that class must count only the eligible
+// sessions — dividing by all live sessions would cap the sole maintainer at
+// half the backlog and let the rest trickle in at one topic per scan tick.
+func TestExpiry_DefaultTopicsFairShareIgnoresIneligibleSessions(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
+	defer restoreScan()
+	restoreMin := pgoutbox.SetMaintenanceMinIntervalForTest(20 * time.Millisecond)
+	defer restoreMin()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)))
+
+	const numTopics = 80
+	for i := range numTopics {
+		rawInsertMessages(t, ctx, schema, fmt.Sprintf("orders-%d", i), 1)
+	}
+
+	// A process-only instance: contributes a live session but has no default
+	// expiration, so it can never claim any of these topics.
+	_, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	// The sole eligible maintainer: its fair share of the default-TTL class
+	// is the entire backlog. Under a live-session denominator it would claim
+	// half up front and the rest one per tick — far past this deadline.
+	_, err = pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema),
+		pgoutbox.WithDefaultExpiration(time.Hour))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		holders := maintenanceLeaseHolders(t, ctx, schema)
+		total := 0
+		for _, n := range holders {
+			total += n
+		}
+		return len(holders) == 1 && total == numTopics
+	}, 2500*time.Millisecond, 50*time.Millisecond,
+		"the sole default-expiration maintainer should claim the whole backlog within a few scan ticks")
 }
 
 // TestExpiry_CatchupSweepDeletesStaleConsumerSessions: instance ids are
@@ -567,7 +615,7 @@ func TestExpiry_CatchupSweepDeletesStaleConsumerSessions(t *testing.T) {
 }
 
 func TestExpiry_PreSessionHolderIsRespected(t *testing.T) {
-	t.Parallel()
+	// No t.Parallel() — modifies global timing vars shared with other tests.
 
 	restoreScan := pgoutbox.SetTopicScanIntervalForTest(100 * time.Millisecond)
 	defer restoreScan()

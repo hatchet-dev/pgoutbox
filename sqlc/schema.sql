@@ -101,7 +101,8 @@ CREATE TRIGGER messages_topics_sync
     EXECUTE FUNCTION topics_insert_trigger_fn();
 
 CREATE TABLE consumer_sessions (
-    consumer_id UUID        NOT NULL,
-    expires_at  TIMESTAMPTZ NOT NULL,
+    consumer_id                  UUID        NOT NULL,
+    expires_at                   TIMESTAMPTZ NOT NULL,
+    maintains_default_expiration BOOLEAN     NOT NULL DEFAULT FALSE,
     CONSTRAINT consumer_sessions_pkey PRIMARY KEY (consumer_id)
 );

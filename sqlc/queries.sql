@@ -168,7 +168,14 @@ WITH RECURSIVE tops AS (
 SELECT topic::text AS topic FROM tops WHERE topic IS NOT NULL;
 
 -- name: CountLiveConsumerSessions :one
-SELECT COUNT(*)
+-- Two fair-share denominators: every live instance can maintain topics with
+-- an explicit TTL, but only instances configured with a default expiration
+-- can even see default-TTL topics as candidates — dividing those by the
+-- total would leave most of a default-TTL backlog to the floor-of-1
+-- trickle.
+SELECT
+    COUNT(*) AS live,
+    COUNT(*) FILTER (WHERE maintains_default_expiration) AS default_maintainers
 FROM /*tmpl*/ consumer_sessions /*tmpl*/
 WHERE expires_at > now();
 
@@ -208,7 +215,8 @@ SET exclusive_consumer_expires_at = $3
 WHERE topic = $1 AND exclusive_consumer_id = $2;
 
 -- name: UpsertConsumerSession :exec
-INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at)
-VALUES ($1, $2)
+INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)
+VALUES ($1, $2, $3)
 ON CONFLICT (consumer_id) DO UPDATE
-SET expires_at = EXCLUDED.expires_at;
+SET expires_at = EXCLUDED.expires_at,
+    maintains_default_expiration = EXCLUDED.maintains_default_expiration;

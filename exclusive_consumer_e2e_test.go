@@ -573,6 +573,82 @@ func TestExclusiveConsumer_ReacquireBeforeOldWatcherFiresDoesNotReintroduceRelea
 	assert.Nil(t, expiresAt, "reacquired topic must defer to the consumer session, not carry an override")
 }
 
+// TestExclusiveConsumer_FailedReacquireDoesNotStrandLease: AcquireTopic stops
+// the topic's watcher (suppressing its expiry write) before re-acquiring. If
+// the re-acquire then fails, the old hold must not be left session-deferred
+// forever — the instance's heartbeat keeps the session fresh for the life of
+// the process and no watcher remains to expire the lease — so the failure
+// path must write the grace-period expiry itself.
+func TestExclusiveConsumer_FailedReacquireDoesNotStrandLease(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(150 * time.Millisecond)
+	defer restoreDuration()
+	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(25 * time.Millisecond)
+	defer restoreRenew()
+	restoreRetry := pgoutbox.SetExclusiveLeaseRetryIntervalForTest(20 * time.Millisecond)
+	defer restoreRetry()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	require.NoError(t, obA.AcquireTopic(ctx, "orders"))
+
+	// Re-acquire with an already-cancelled ctx: the old watcher is stopped,
+	// then the acquire fails before any replacement state is installed.
+	cancelledCtx, cancelNow := context.WithCancel(ctx)
+	cancelNow()
+	require.Error(t, obA.AcquireTopic(cancelledCtx, "orders"))
+
+	// A's heartbeat stays healthy, so only the failure path's expiry write
+	// can end the hold. B must acquire once the grace period lapses.
+	acquireCtx, acquireCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer acquireCancel()
+	require.NoError(t, obB.AcquireTopic(acquireCtx, "orders"),
+		"failed reacquire stranded the lease: nothing left to expire it while the session heartbeat lives")
+}
+
+// TestExclusiveConsumer_FailedReleaseDoesNotStrandLease: same stranding shape
+// as a failed reacquire — ReleaseTopic stops the watcher, and if the release
+// write then fails (typically an already-cancelled caller ctx), the fallback
+// grace-period expiry must be written so the lease still lapses.
+func TestExclusiveConsumer_FailedReleaseDoesNotStrandLease(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(150 * time.Millisecond)
+	defer restoreDuration()
+	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(25 * time.Millisecond)
+	defer restoreRenew()
+	restoreRetry := pgoutbox.SetExclusiveLeaseRetryIntervalForTest(20 * time.Millisecond)
+	defer restoreRetry()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	require.NoError(t, obA.AcquireTopic(ctx, "orders"))
+
+	cancelledCtx, cancelNow := context.WithCancel(ctx)
+	cancelNow()
+	require.Error(t, obA.ReleaseTopic(cancelledCtx, "orders"))
+
+	acquireCtx, acquireCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer acquireCancel()
+	require.NoError(t, obB.AcquireTopic(acquireCtx, "orders"),
+		"failed release stranded the lease: nothing left to expire it while the session heartbeat lives")
+}
+
 // TestExclusiveConsumer_AcquireRestoresMissingConsumerSession: an acquired
 // lease is only as alive as this instance's consumer session, so AcquireTopic
 // refreshes the session inside the acquire transaction rather than trusting

@@ -77,7 +77,9 @@ func TestLeaseWatcher_StopSuppressesOnCancel(t *testing.T) {
 	})
 
 	w.Start(context.Background(), "orders")
-	w.Stop("orders")
+	if !w.Stop("orders") {
+		t.Fatal("Stop did not report stopping the running watcher")
+	}
 
 	time.Sleep(50 * time.Millisecond)
 	if got := calls.Load(); got != 0 {
@@ -93,7 +95,9 @@ func TestLeaseWatcher_StopIsNoOpWhenNotRunning(t *testing.T) {
 	// Must return promptly without panicking, even though nothing was started.
 	done := make(chan struct{})
 	go func() {
-		w.Stop("orders")
+		if w.Stop("orders") {
+			t.Error("Stop reported stopping a watcher that was never started")
+		}
 		close(done)
 	}()
 	select {

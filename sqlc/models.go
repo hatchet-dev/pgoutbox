@@ -10,8 +10,9 @@ import (
 )
 
 type ConsumerSession struct {
-	ConsumerID uuid.UUID          `json:"consumer_id"`
-	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	ConsumerID                 uuid.UUID          `json:"consumer_id"`
+	ExpiresAt                  pgtype.Timestamptz `json:"expires_at"`
+	MaintainsDefaultExpiration bool               `json:"maintains_default_expiration"`
 }
 
 type MaintenanceLease struct {
