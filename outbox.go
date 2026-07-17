@@ -53,6 +53,19 @@ type Outbox interface {
 	// the calling instance must hold the exclusive lease (via AcquireTopic) or an error is returned.
 	ProcessMessages(ctx context.Context, topic string, opts ...ProcessOpt) ([]*sqlc.Message, error)
 
+	// Subscribe blocks and continuously drains the topic: it runs
+	// ProcessMessages until the topic is empty, then waits for the poll
+	// interval to elapse — or, when the outbox was built with WithPubSub, for
+	// a new-message notification — and drains again. Processing errors are
+	// logged to the WithLogger logger and retried on the next wake-up; as
+	// with ProcessMessages, topics with an active exclusive consumer require
+	// AcquireTopic first — either call it beforehand, or pass WithExclusive
+	// to have Subscribe acquire, re-acquire, and release the lease itself.
+	// Returns ctx.Err() when ctx ends, or an error immediately if no flusher
+	// is registered for the topic, the PubSub subscription cannot be
+	// established, or the WithExclusive initial acquisition fails.
+	Subscribe(ctx context.Context, topic string, opts ...SubscribeOpt) error
+
 	// AcquireTopic blocks until this instance holds the exclusive processing lease
 	// for the named topic, then returns. A background goroutine automatically renews
 	// the lease until ctx is cancelled or ReleaseTopic is called, at which point the
@@ -73,6 +86,11 @@ type Outbox interface {
 // ErrExclusiveLeaseHeld is returned by ProcessMessages when another outbox
 // instance currently holds a valid exclusive lease for the topic.
 var ErrExclusiveLeaseHeld = errors.New("exclusive lease held by another instance")
+
+// ErrExclusiveLeaseRequired is returned by ProcessMessages when the topic has
+// an exclusive-consumer record but this instance does not hold a live lease —
+// either AcquireTopic was never called or the lease has since expired.
+var ErrExclusiveLeaseRequired = errors.New("exclusive lease required: call AcquireTopic first")
 
 // defaultBatchSize is the number of messages ProcessMessages will pull per
 // call when the caller has not specified WithBatchSize.
@@ -164,6 +182,7 @@ type outboxImplOpts struct {
 	expirations       map[string]time.Duration
 	defaultExpiration time.Duration
 	logger            zerolog.Logger
+	pubsub            PubSub
 }
 
 func defaultOpts() *outboxImplOpts {
@@ -192,6 +211,11 @@ type outboxImpl struct {
 
 	// logger receives error-level messages from the background maintenance goroutines.
 	logger zerolog.Logger
+
+	// pubsub carries new-message notifications between AddMessages and
+	// Subscribe. Nil unless configured via WithPubSub; everything works
+	// without it, Subscribe just degrades to pure polling.
+	pubsub PubSub
 
 	flushers sync.Map
 
@@ -257,6 +281,19 @@ func WithLogger(l zerolog.Logger) OutboxOpt {
 	}
 }
 
+// WithPubSub attaches a PubSub used to cut end-to-end latency: AddMessages
+// publishes a notification for each staged topic and Subscribe wakes on those
+// notifications instead of waiting out its poll interval. Delivery is
+// best-effort — Subscribe's polling remains the fallback for lost
+// notifications. If ps also implements TxPublisher (NewPGPubSub does), the
+// notification is published inside the AddMessages transaction and delivered
+// exactly when it commits.
+func WithPubSub(ps PubSub) OutboxOpt {
+	return func(opts *outboxImplOpts) {
+		opts.pubsub = ps
+	}
+}
+
 // NewOutbox creates an outbox backed by pool and starts the background
 // maintenance goroutines. The goroutines run until ctx is cancelled; pass a
 // context tied to your application lifetime (e.g. from signal.NotifyContext).
@@ -292,6 +329,7 @@ func NewOutbox(ctx context.Context, pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox
 		expirations:       expirations,
 		defaultExpiration: opts.defaultExpiration,
 		logger:            opts.logger,
+		pubsub:            opts.pubsub,
 		managed:           make(map[string]*managedTopic),
 	}
 	o.exclusiveLeaseWatcher = newLeaseWatcher(o.expireExclusiveLeaseAfterGrace)
@@ -363,6 +401,32 @@ func (o *outboxImpl) AddMessages(ctx context.Context, tx pgx.Tx, topic string, m
 		return fmt.Errorf("could not insert messages for topic %q: %w", topic, err)
 	}
 
+	return o.publishNewMessageNotification(ctx, tx, topic)
+}
+
+// publishNewMessageNotification wakes Subscribe callers after AddMessages
+// stages messages. It prefers the TxPublisher path — publishing on the
+// caller's transaction so the notification lands exactly when the insert
+// commits — and falls back to an immediate best-effort Pub otherwise.
+func (o *outboxImpl) publishNewMessageNotification(ctx context.Context, tx pgx.Tx, topic string) error {
+	if o.pubsub == nil {
+		return nil
+	}
+
+	if txp, ok := o.pubsub.(TxPublisher); ok {
+		// This shares the caller's transaction: a failure has aborted it, so
+		// surface the error rather than pretending the insert succeeded.
+		if err := txp.PubInTx(ctx, tx, topic, nil); err != nil {
+			return fmt.Errorf("could not publish new-message notification for topic %q: %w", topic, err)
+		}
+		return nil
+	}
+
+	// Out-of-band publish is best-effort: the messages are durably staged and
+	// pollers pick them up within a poll interval if the notification is lost.
+	if err := o.pubsub.Pub(ctx, topic, nil); err != nil {
+		o.logger.Error().Err(err).Str("topic", topic).Msg("subscribe: failed to publish new-message notification")
+	}
 	return nil
 }
 
@@ -584,7 +648,7 @@ func (o *outboxImpl) checkExclusiveAccessForUpdate(ctx context.Context, wrapped 
 		if row.ExclusiveConsumerExpiresAt.Valid && row.ExclusiveConsumerExpiresAt.Time.After(time.Now()) {
 			return nil
 		}
-		return fmt.Errorf("exclusive lease for topic %q has expired; call AcquireTopic to renew", topic)
+		return fmt.Errorf("exclusive lease for topic %q has expired: %w", topic, ErrExclusiveLeaseRequired)
 	}
 
 	if row.ExclusiveConsumerExpiresAt.Valid && row.ExclusiveConsumerExpiresAt.Time.After(time.Now()) {
@@ -592,7 +656,7 @@ func (o *outboxImpl) checkExclusiveAccessForUpdate(ctx context.Context, wrapped 
 	}
 
 	// Another instance held the lease but it has expired; require explicit acquire.
-	return fmt.Errorf("exclusive access required for topic %q: call AcquireTopic first", topic)
+	return fmt.Errorf("exclusive access required for topic %q: %w", topic, ErrExclusiveLeaseRequired)
 }
 
 func (o *outboxImpl) ProcessMessages(ctx context.Context, topic string, popts ...ProcessOpt) ([]*sqlc.Message, error) {
