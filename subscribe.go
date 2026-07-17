@@ -76,11 +76,14 @@ func (o *outboxImpl) Subscribe(ctx context.Context, topic string, sopts ...Subsc
 			return fmt.Errorf("could not acquire exclusive lease for topic %q: %w", topic, err)
 		}
 		// Hand the lease off immediately on exit instead of letting it lapse
-		// through the grace period. Detached ctx because the usual way out is
-		// this ctx being cancelled; a failed release degrades to the
+		// through the grace period. Detached from ctx (the usual way out is
+		// this ctx being cancelled) but bounded, so a stalled database can't
+		// hang subscriber shutdown; a missed release degrades to the
 		// grace-period lapse inside ReleaseTopic itself.
 		defer func() {
-			if err := o.ReleaseTopic(context.WithoutCancel(ctx), topic); err != nil {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exclusiveLeaseWriteTimeout)
+			defer cancel()
+			if err := o.ReleaseTopic(releaseCtx, topic); err != nil {
 				o.logger.Error().Err(err).Str("topic", topic).Msg("subscribe: failed to release exclusive lease")
 			}
 		}()

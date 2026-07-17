@@ -176,6 +176,15 @@ var exclusiveLeaseRenewInterval = newAtomicDuration(10 * time.Second)
 // to acquire the lease when another instance currently holds it.
 var exclusiveLeaseRetryInterval = newAtomicDuration(1 * time.Second)
 
+// exclusiveLeaseWriteTimeout bounds the detached, best-effort lease writes:
+// the immediate release when an exclusive Subscribe exits and the
+// grace-period expiry written after a hold ends. These writes are detached
+// from their caller's (usually already-cancelled) ctx, so without a bound a
+// stalled database would block shutdown indefinitely; a write that cannot
+// land within this window is better abandoned — the holder's consumer
+// session lapsing covers the failure case.
+const exclusiveLeaseWriteTimeout = 10 * time.Second
+
 type outboxImplOpts struct {
 	schema            string
 	autoMigrate       bool
@@ -576,7 +585,12 @@ func (o *outboxImpl) tryAcquireTopicLease(ctx context.Context, topic string) (bo
 // lapses one lease duration from now. Called by o.exclusiveLeaseWatcher with
 // an already-detached ctx once the AcquireTopic ctx has ended. The WHERE
 // clause makes this a silent no-op if another instance has since taken over.
+// Self-bounded so that no caller — the watcher goroutine or the
+// AcquireTopic/ReleaseTopic failure paths — can hang on a stalled database.
 func (o *outboxImpl) expireExclusiveLeaseAfterGrace(ctx context.Context, topic string) {
+	ctx, cancel := context.WithTimeout(ctx, exclusiveLeaseWriteTimeout)
+	defer cancel()
+
 	expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration.Load())
 	err := o.queries.RenewTopicExclusiveConsumer(ctx, dbwrap.New(o.pool, o.schema), sqlc.RenewTopicExclusiveConsumerParams{
 		Topic:                      topic,
