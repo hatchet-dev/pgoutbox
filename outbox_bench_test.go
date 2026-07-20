@@ -53,6 +53,10 @@ func (c *txCountingFlusher) Flush(ctx pgoutbox.FlushContext, msgs []*sqlc.Messag
 // drains each topic.
 var benchTopicCounts = []int{1, 10}
 
+// benchAddBatchSizes is the producer batch-size dimension: how many messages
+// each AddMessages transaction stages.
+var benchAddBatchSizes = []int{1, 10, 100}
+
 func BenchmarkOutbox_WriteAndPublishThroughput(b *testing.B) {
 	benchmarkThroughputMatrix(b, false)
 }
@@ -67,22 +71,25 @@ func BenchmarkOutbox_SubscribeThroughput(b *testing.B) {
 	benchmarkThroughputMatrix(b, true)
 }
 
-// benchmarkThroughputMatrix runs the Flush/TxFlush × topic-count grid.
+// benchmarkThroughputMatrix runs the Flush/TxFlush × topic-count ×
+// producer-batch-size grid.
 func benchmarkThroughputMatrix(b *testing.B, useSubscribe bool) {
 	for _, numTopics := range benchTopicCounts {
-		b.Run(fmt.Sprintf("Flush/topics=%d", numTopics), func(b *testing.B) {
-			benchmarkThroughput(b, func(_ string, onFlush func(int)) pgoutbox.Flusher {
-				return &countingFlusher{onFlush: onFlush}
-			}, useSubscribe, numTopics)
-		})
-		b.Run(fmt.Sprintf("TxFlush/topics=%d", numTopics), func(b *testing.B) {
-			benchmarkThroughput(b, func(schema string, onFlush func(int)) pgoutbox.Flusher {
-				table := pgx.Identifier{schema, "bench_side_log"}.Sanitize()
-				_, err := sharedPool.Exec(context.Background(), fmt.Sprintf("CREATE TABLE %s (msg_id bigint NOT NULL)", table))
-				require.NoError(b, err)
-				return &txCountingFlusher{table: table, onFlush: onFlush}
-			}, useSubscribe, numTopics)
-		})
+		for _, addBatch := range benchAddBatchSizes {
+			b.Run(fmt.Sprintf("Flush/topics=%d/batch=%d", numTopics, addBatch), func(b *testing.B) {
+				benchmarkThroughput(b, func(_ string, onFlush func(int)) pgoutbox.Flusher {
+					return &countingFlusher{onFlush: onFlush}
+				}, useSubscribe, numTopics, addBatch)
+			})
+			b.Run(fmt.Sprintf("TxFlush/topics=%d/batch=%d", numTopics, addBatch), func(b *testing.B) {
+				benchmarkThroughput(b, func(schema string, onFlush func(int)) pgoutbox.Flusher {
+					table := pgx.Identifier{schema, "bench_side_log"}.Sanitize()
+					_, err := sharedPool.Exec(context.Background(), fmt.Sprintf("CREATE TABLE %s (msg_id bigint NOT NULL)", table))
+					require.NoError(b, err)
+					return &txCountingFlusher{table: table, onFlush: onFlush}
+				}, useSubscribe, numTopics, addBatch)
+			})
+		}
 	}
 }
 
@@ -91,9 +98,10 @@ func benchmarkThroughputMatrix(b *testing.B, useSubscribe bool) {
 // inFlight-releasing callback, letting us reuse the harness for both the plain
 // Flush path and the FlushWithTx path. With useSubscribe each topic's consumer
 // is a Subscribe call woken by pg_notify (and AddMessages pays the in-tx
-// publish); otherwise it is a busy-polling ProcessMessages loop. Producers
-// assign messages to the numTopics topics round-robin.
-func benchmarkThroughput(b *testing.B, newFlusher func(schema string, onFlush func(n int)) pgoutbox.Flusher, useSubscribe bool, numTopics int) {
+// publish); otherwise it is a busy-polling ProcessMessages loop. Each producer
+// transaction stages addBatchSize messages via one AddMessages call, with
+// batches assigned to the numTopics topics round-robin.
+func benchmarkThroughput(b *testing.B, newFlusher func(schema string, onFlush func(n int)) pgoutbox.Flusher, useSubscribe bool, numTopics, addBatchSize int) {
 	const (
 		numWorkers  = MAX_CONNS
 		maxInFlight = 5000
@@ -176,23 +184,32 @@ func benchmarkThroughput(b *testing.B, newFlusher func(schema string, onFlush fu
 
 	b.ResetTimer()
 
-	work := make(chan struct{})
-	var msgIdx atomic.Int64
+	// Each work item is one producer transaction staging that many messages
+	// (addBatchSize, or less for the final remainder batch) on one topic.
+	work := make(chan int)
+	var batchIdx atomic.Int64
 	var wg sync.WaitGroup
 	for range numWorkers {
 		wg.Go(func() {
-			for range work {
-				inFlight <- struct{}{}
-				topic := topics[msgIdx.Add(1)%int64(numTopics)]
+			batch := make([]pgoutbox.MessageOpts, addBatchSize)
+			for i := range batch {
+				batch[i] = pgoutbox.MessageOpts{Payload: payload}
+			}
+			for n := range work {
+				// Workers hold at most numWorkers*addBatchSize slots while
+				// blocked here, well under maxInFlight, so partial
+				// acquisition cannot deadlock.
+				for range n {
+					inFlight <- struct{}{}
+				}
+				topic := topics[batchIdx.Add(1)%int64(numTopics)]
 
 				tx, err := sharedPool.Begin(ctx)
 				if err != nil {
 					b.Errorf("begin: %v", err)
 					return
 				}
-				if err := outbox.AddMessages(ctx, tx, topic, []pgoutbox.MessageOpts{
-					{Payload: payload},
-				}); err != nil {
+				if err := outbox.AddMessages(ctx, tx, topic, batch[:n]); err != nil {
 					_ = tx.Rollback(ctx)
 					b.Errorf("AddMessages: %v", err)
 					return
@@ -205,8 +222,10 @@ func benchmarkThroughput(b *testing.B, newFlusher func(schema string, onFlush fu
 		})
 	}
 
-	for range b.N {
-		work <- struct{}{}
+	for remaining := b.N; remaining > 0; {
+		n := min(addBatchSize, remaining)
+		work <- n
+		remaining -= n
 	}
 	close(work)
 	wg.Wait()

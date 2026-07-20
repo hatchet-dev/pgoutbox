@@ -247,7 +247,7 @@ You can run benchmarks locally; for example, to write and flush 100k messages, y
 go test -bench=. -benchtime=100000x
 ```
 
-`BenchmarkOutbox_WriteAndPublishThroughput` drains each topic with a busy-polling `ProcessMessages` loop; `BenchmarkOutbox_SubscribeThroughput` drains each topic with a `Subscribe` call woken by `LISTEN`/`NOTIFY` (its poll interval is set far above the benchmark runtime, so throughput is carried entirely by notifications — and each producer commit pays the in-transaction `pg_notify`). Both run at 1 and 10 topics, with producers spreading messages round-robin and one consumer per topic. On a local Macbook with an M3 Max core:
+`BenchmarkOutbox_WriteAndPublishThroughput` drains each topic with a busy-polling `ProcessMessages` loop; `BenchmarkOutbox_SubscribeThroughput` drains each topic with a `Subscribe` call woken by `LISTEN`/`NOTIFY` (its poll interval is set far above the benchmark runtime, so throughput is carried entirely by notifications — and each producer commit pays the in-transaction `pg_notify`). Both run a matrix of 1 and 10 topics (messages spread round-robin, one consumer per topic) and producer batch sizes of 1, 10, and 100 messages per `AddMessages` transaction. On a local Macbook with an M3 Max core:
 
 ```
 $ go test -bench=. -benchtime=100000x
@@ -255,12 +255,30 @@ goos: darwin
 goarch: arm64
 pkg: github.com/hatchet-dev/pgoutbox
 cpu: Apple M3 Max
-BenchmarkOutbox_WriteAndPublishThroughput/Flush/topics=1-14         	  100000	    139432 ns/op	      7172 msgs/sec
-BenchmarkOutbox_WriteAndPublishThroughput/TxFlush/topics=1-14       	  100000	    248696 ns/op	      4021 msgs/sec
-BenchmarkOutbox_WriteAndPublishThroughput/Flush/topics=10-14        	  100000	    245562 ns/op	      4072 msgs/sec
-BenchmarkOutbox_WriteAndPublishThroughput/TxFlush/topics=10-14      	  100000	    242325 ns/op	      4127 msgs/sec
-BenchmarkOutbox_SubscribeThroughput/Flush/topics=1-14               	  100000	    188324 ns/op	      5310 msgs/sec
-BenchmarkOutbox_SubscribeThroughput/TxFlush/topics=1-14             	  100000	    305362 ns/op	      3275 msgs/sec
-BenchmarkOutbox_SubscribeThroughput/Flush/topics=10-14              	  100000	    301837 ns/op	      3313 msgs/sec
-BenchmarkOutbox_SubscribeThroughput/TxFlush/topics=10-14            	  100000	    321406 ns/op	      3111 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/Flush/topics=1/batch=1-14         	  100000	    125855 ns/op	      7946 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/TxFlush/topics=1/batch=1-14       	  100000	    219546 ns/op	      4555 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/Flush/topics=1/batch=10-14        	  100000	     16328 ns/op	     61244 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/TxFlush/topics=1/batch=10-14      	  100000	    133446 ns/op	      7494 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/Flush/topics=1/batch=100-14       	  100000	      6806 ns/op	    146925 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/TxFlush/topics=1/batch=100-14     	  100000	    150929 ns/op	      6626 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/Flush/topics=10/batch=1-14        	  100000	    293680 ns/op	      3405 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/TxFlush/topics=10/batch=1-14      	  100000	    241538 ns/op	      4140 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/Flush/topics=10/batch=10-14       	  100000	     25111 ns/op	     39822 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/TxFlush/topics=10/batch=10-14     	  100000	     48755 ns/op	     20511 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/Flush/topics=10/batch=100-14      	  100000	      4468 ns/op	    223817 msgs/sec
+BenchmarkOutbox_WriteAndPublishThroughput/TxFlush/topics=10/batch=100-14    	  100000	     36192 ns/op	     27631 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/Flush/topics=1/batch=1-14               	  100000	    209316 ns/op	      4777 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/TxFlush/topics=1/batch=1-14             	  100000	    301901 ns/op	      3312 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/Flush/topics=1/batch=10-14              	  100000	     21391 ns/op	     46749 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/TxFlush/topics=1/batch=10-14            	  100000	    153971 ns/op	      6495 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/Flush/topics=1/batch=100-14             	  100000	      7479 ns/op	    133706 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/TxFlush/topics=1/batch=100-14           	  100000	    141189 ns/op	      7083 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/Flush/topics=10/batch=1-14              	  100000	    289379 ns/op	      3456 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/TxFlush/topics=10/batch=1-14            	  100000	    924623 ns/op	      1082 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/Flush/topics=10/batch=10-14             	  100000	     33516 ns/op	     29836 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/TxFlush/topics=10/batch=10-14           	  100000	     58475 ns/op	     17101 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/Flush/topics=10/batch=100-14            	  100000	      5352 ns/op	    186840 msgs/sec
+BenchmarkOutbox_SubscribeThroughput/TxFlush/topics=10/batch=100-14          	  100000	     39021 ns/op	     25627 msgs/sec
 ```
+
+Batching producer writes is the single biggest lever: staging 100 messages per transaction reaches ~150-220k msgs/sec on the cheap-flusher path, roughly 20× the one-message-per-transaction rate. The `batch=1` cells run long enough to be sensitive to background database noise (checkpoints, autovacuum), so expect swings between runs — the 1082 msgs/sec outlier above measures ~3300 msgs/sec in isolation.
