@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -213,8 +214,11 @@ func (p *pgPubSub) dispatch(msg *PubSubMessage) {
 	defer p.subscribersMu.Unlock()
 
 	for ch := range p.subscribers[msg.Topic] {
+		// Every subscriber gets its own copy, payload included, so a consumer
+		// that mutates a delivered message can't affect (or race) the others.
+		delivery := &PubSubMessage{Topic: msg.Topic, Payload: slices.Clone(msg.Payload)}
 		select {
-		case ch <- msg:
+		case ch <- delivery:
 		default:
 			// Subscriber buffer full — drop rather than block the listener.
 		}

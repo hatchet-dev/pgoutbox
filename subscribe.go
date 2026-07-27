@@ -98,6 +98,9 @@ func (o *outboxImpl) Subscribe(ctx context.Context, topic string, sopts ...Subsc
 		notifications = ch
 	}
 
+	pollTimer := time.NewTimer(so.pollInterval)
+	defer pollTimer.Stop()
+
 	for {
 		// Anything already buffered is covered by the pass below — drop it now
 		// so it doesn't immediately trigger a redundant pass. A notification
@@ -124,10 +127,16 @@ func (o *outboxImpl) Subscribe(ctx context.Context, topic string, sopts ...Subsc
 			}
 		}
 
+		// One reused timer instead of a time.After per iteration, so frequent
+		// notification wake-ups don't allocate a timer each loop. Reset
+		// discards any pending fire from a previous iteration (Go 1.23+ timer
+		// semantics), giving each wait the full poll interval.
+		pollTimer.Reset(so.pollInterval)
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(so.pollInterval):
+		case <-pollTimer.C:
 		case _, ok := <-notifications:
 			if !ok {
 				// The PubSub shut down before our ctx did; degrade to polling.
