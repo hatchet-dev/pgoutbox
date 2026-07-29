@@ -39,11 +39,11 @@ type PubSub interface {
 
 // TxPublisher is an optional interface a PubSub can implement to publish
 // within a pgx transaction. When the PubSub configured via WithPubSub
-// implements it, AddMessages publishes its new-message notification inside
-// the caller's transaction, so the notification is delivered exactly when the
-// insert commits — and never for a transaction that rolls back. Without it,
-// AddMessages falls back to a best-effort Pub at insert time, which can wake
-// subscribers before the messages are visible.
+// implements it (detected once, at NewOutbox), AddMessages publishes its
+// new-message notification inside the caller's transaction, so the
+// notification is delivered exactly when the insert commits — and never for a
+// transaction that rolls back. Without it, the notification is deferred to a
+// Notifier the caller passes via WithNotifier and invokes after commit.
 type TxPublisher interface {
 	PubInTx(ctx context.Context, tx pgx.Tx, topic string, payload []byte) error
 }

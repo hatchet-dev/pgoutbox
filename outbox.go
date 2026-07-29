@@ -46,7 +46,14 @@ type MessageOpts struct {
 type Outbox interface {
 	AddFlusher(topic string, flusher Flusher)
 
-	AddMessages(ctx context.Context, tx pgx.Tx, topic string, msgs []MessageOpts) error
+	// AddMessages stages msgs on the topic within the caller's transaction.
+	// When a PubSub is configured, it also arranges the new-message
+	// notification that wakes Subscribe callers: TxPublisher transports
+	// publish it on tx itself, and generic transports hand it to the Notifier
+	// passed via WithNotifier, for the caller to fire after commit (see
+	// Notifier). Skipping the option never loses messages, it only leaves
+	// generic transports waiting out Subscribe's poll interval.
+	AddMessages(ctx context.Context, tx pgx.Tx, topic string, msgs []MessageOpts, opts ...AddOpt) error
 
 	// ProcessMessages grabs a batch of messages for the given topic, flushes them using the registered Flusher for that
 	// topic, and deletes them from the outbox if the flush is successful. If the topic has an active exclusive consumer,
@@ -95,6 +102,48 @@ var ErrExclusiveLeaseRequired = errors.New("exclusive lease required: call Acqui
 // defaultBatchSize is the number of messages ProcessMessages will pull per
 // call when the caller has not specified WithBatchSize.
 const defaultBatchSize = 1000
+
+// AddOpt is a per-call option for AddMessages.
+type AddOpt func(*addOpts)
+
+type addOpts struct {
+	notifier *Notifier
+}
+
+// WithNotifier has AddMessages collect its post-commit notification into n
+// instead of dropping it. Only generic (non-TxPublisher) PubSubs need it —
+// they have no way to defer a publish to commit time, so the caller carries
+// the notification past the transaction and fires it with Notify. One
+// Notifier can be shared by every AddMessages call in a transaction and
+// fired once after commit.
+func WithNotifier(n *Notifier) AddOpt {
+	return func(opts *addOpts) {
+		opts.notifier = n
+	}
+}
+
+// Notifier accumulates the new-message notifications of the AddMessages calls
+// it is passed to (via WithNotifier), so they can be published once the
+// staging transaction has committed. The zero value is ready to use; it is
+// not safe for concurrent use, mirroring the pgx.Tx it accompanies.
+type Notifier struct {
+	hooks []func(context.Context)
+}
+
+// Notify publishes the accumulated notifications. Invoke it once, after the
+// transaction commits successfully; after a rollback, simply discard the
+// Notifier. It is a no-op when there is nothing to publish — no PubSub
+// configured, no messages staged, or a TxPublisher transport that already
+// published on the transaction. Publishing is best-effort: failures are
+// logged to the WithLogger logger, not returned, since durably staged
+// messages are picked up by Subscribe's polling fallback regardless. Calling
+// it more than once just repeats the wake-ups (harmless, like any spurious
+// notification).
+func (n *Notifier) Notify(ctx context.Context) {
+	for _, hook := range n.hooks {
+		hook(ctx)
+	}
+}
 
 // ProcessOpt is a per-call option for ProcessMessages.
 type ProcessOpt func(*processOpts)
@@ -226,6 +275,12 @@ type outboxImpl struct {
 	// without it, Subscribe just degrades to pure polling.
 	pubsub PubSub
 
+	// txPub is pubsub's TxPublisher facet, resolved once at NewOutbox so
+	// AddMessages doesn't decide notification semantics per call. Non-nil iff
+	// pubsub implements TxPublisher, in which case notifications are published
+	// on the caller's transaction instead of via the returned NotifyFunc.
+	txPub TxPublisher
+
 	flushers sync.Map
 
 	// exclusiveLeaseWatcher holds one goroutine per held topic that waits for
@@ -296,7 +351,8 @@ func WithLogger(l zerolog.Logger) OutboxOpt {
 // best-effort — Subscribe's polling remains the fallback for lost
 // notifications. If ps also implements TxPublisher (NewPGPubSub does), the
 // notification is published inside the AddMessages transaction and delivered
-// exactly when it commits.
+// exactly when it commits; otherwise pass a Notifier to AddMessages via
+// WithNotifier and invoke Notify after committing.
 func WithPubSub(ps PubSub) OutboxOpt {
 	return func(opts *outboxImplOpts) {
 		opts.pubsub = ps
@@ -339,6 +395,7 @@ func NewOutbox(ctx context.Context, pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox
 		defaultExpiration: opts.defaultExpiration,
 		logger:            opts.logger,
 		pubsub:            opts.pubsub,
+		txPub:             asTxPublisher(opts.pubsub),
 		managed:           make(map[string]*managedTopic),
 	}
 	o.exclusiveLeaseWatcher = newLeaseWatcher(o.expireExclusiveLeaseAfterGrace)
@@ -383,13 +440,19 @@ func (o *outboxImpl) getFlusher(topic string) (Flusher, bool) {
 	return flusher, true
 }
 
-func (o *outboxImpl) AddMessages(ctx context.Context, tx pgx.Tx, topic string, msgs []MessageOpts) error {
+func (o *outboxImpl) AddMessages(ctx context.Context, tx pgx.Tx, topic string, msgs []MessageOpts, aopts ...AddOpt) error {
 	if topic == "" {
 		return fmt.Errorf("topic must not be empty")
 	}
 
 	if len(msgs) == 0 {
 		return nil
+	}
+
+	opts := &addOpts{}
+
+	for _, f := range aopts {
+		f(opts)
 	}
 
 	params := make([]sqlc.InsertMessageParams, len(msgs))
@@ -410,33 +473,42 @@ func (o *outboxImpl) AddMessages(ctx context.Context, tx pgx.Tx, topic string, m
 		return fmt.Errorf("could not insert messages for topic %q: %w", topic, err)
 	}
 
-	return o.publishNewMessageNotification(ctx, tx, topic)
-}
-
-// publishNewMessageNotification wakes Subscribe callers after AddMessages
-// stages messages. It prefers the TxPublisher path — publishing on the
-// caller's transaction so the notification lands exactly when the insert
-// commits — and falls back to an immediate best-effort Pub otherwise.
-func (o *outboxImpl) publishNewMessageNotification(ctx context.Context, tx pgx.Tx, topic string) error {
-	if o.pubsub == nil {
-		return nil
-	}
-
-	if txp, ok := o.pubsub.(TxPublisher); ok {
+	if o.txPub != nil {
 		// This shares the caller's transaction: a failure has aborted it, so
-		// surface the error rather than pretending the insert succeeded.
-		if err := txp.PubInTx(ctx, tx, topic, nil); err != nil {
+		// surface the error rather than pretending the insert succeeded. The
+		// notification lands exactly when the transaction commits, leaving
+		// nothing for a WithNotifier Notifier to carry.
+		if err := o.txPub.PubInTx(ctx, tx, topic, nil); err != nil {
 			return fmt.Errorf("could not publish new-message notification for topic %q: %w", topic, err)
 		}
 		return nil
 	}
 
-	// Out-of-band publish is best-effort: the messages are durably staged and
-	// pollers pick them up within a poll interval if the notification is lost.
-	if err := o.pubsub.Pub(ctx, topic, nil); err != nil {
-		o.logger.Error().Err(err).Str("topic", topic).Msg("subscribe: failed to publish new-message notification")
+	if o.pubsub != nil && opts.notifier != nil {
+		opts.notifier.hooks = append(opts.notifier.hooks, o.newMessageNotifier(topic))
 	}
+
 	return nil
+}
+
+// newMessageNotifier builds the post-commit notification hook for a generic
+// (non-Tx) PubSub. Publishing out-of-band is best-effort: the messages are
+// durably staged and pollers pick them up within a poll interval if the
+// notification is lost, so failures are logged rather than returned.
+func (o *outboxImpl) newMessageNotifier(topic string) func(context.Context) {
+	return func(ctx context.Context) {
+		if err := o.pubsub.Pub(ctx, topic, nil); err != nil {
+			o.logger.Error().Err(err).Str("topic", topic).Msg("subscribe: failed to publish new-message notification")
+		}
+	}
+}
+
+// asTxPublisher pins down a PubSub's notification semantics once, at
+// construction: nil (making AddMessages defer to the returned NotifyFunc)
+// unless ps publishes transactionally.
+func asTxPublisher(ps PubSub) TxPublisher {
+	txp, _ := ps.(TxPublisher)
+	return txp
 }
 
 func (o *outboxImpl) AcquireTopic(ctx context.Context, topic string) error {
