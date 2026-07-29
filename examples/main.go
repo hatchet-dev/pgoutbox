@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/hatchet-dev/pgoutbox"
 	"github.com/hatchet-dev/pgoutbox/sqlc"
@@ -19,7 +21,7 @@ const (
 
 type printFlusher struct{}
 
-func (printFlusher) Flush(_ context.Context, msgs []*sqlc.Message) error {
+func (printFlusher) Flush(_ pgoutbox.FlushContext, msgs []*sqlc.Message) error {
 	for _, m := range msgs {
 		fmt.Printf("  flushed id=%d topic=%s payload=%s\n", m.ID, m.Topic, string(m.Payload))
 	}
@@ -42,11 +44,26 @@ func main() {
 	}
 	defer pool.Close()
 
-	outbox, err := pgoutbox.NewOutbox(pool, pgoutbox.WithSchema(schema))
+	// LISTEN/NOTIFY pubsub: Subscribe wakes as soon as AddMessages commits
+	// instead of waiting out its poll interval.
+	pubsub, err := pgoutbox.NewPGPubSub(ctx, pool)
+	if err != nil {
+		log.Fatalf("create pubsub: %v", err)
+	}
+
+	outbox, err := pgoutbox.NewOutbox(ctx, pool, pgoutbox.WithSchema(schema), pgoutbox.WithPubSub(pubsub))
 	if err != nil {
 		log.Fatalf("create outbox: %v", err)
 	}
 	outbox.AddFlusher(topic, printFlusher{})
+
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- outbox.Subscribe(subCtx, topic, pgoutbox.WithPollInterval(30*time.Second))
+	}()
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -67,11 +84,15 @@ func main() {
 		log.Fatalf("commit: %v", err)
 	}
 
-	fmt.Printf("staged %d messages on topic %q in schema %q\n", len(msgs), topic, schema)
+	fmt.Printf("staged %d messages on topic %q in schema %q; waiting for the subscriber...\n", len(msgs), topic, schema)
 
-	fmt.Println("processing...")
-	if _, err := outbox.ProcessMessages(ctx, topic); err != nil {
-		log.Fatalf("process: %v", err)
+	// The commit above delivers the notification, so the subscriber flushes
+	// well within this window despite the 30s poll interval.
+	time.Sleep(2 * time.Second)
+	cancel()
+
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("subscribe: %v", err)
 	}
 	fmt.Println("done")
 }
