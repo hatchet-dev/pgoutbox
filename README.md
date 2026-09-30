@@ -6,7 +6,7 @@
 
 ## Why?
 
-While working on [Hatchet](https://github.com/hatchet-dev/hatchet) we needed a reliable and performant way to durably persist messages over a message boundary. In particular, we needed:
+While working on [Hatchet](https://github.com/hatchet-dev/hatchet) we needed a reliable and performant way to durably persist messages over a message boundary using Postgres. In particular, we needed:
 
 - **Batched reads and writes.** See [Atomic flush and delete](#atomic-flush-and-delete) and [Benchmarks](#benchmarks).
 - **Exclusive consumers with leasing semantics.** see [Exclusive consumers](#exclusive-consumers).
