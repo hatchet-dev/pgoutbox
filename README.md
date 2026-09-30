@@ -8,8 +8,8 @@
 
 While working on [Hatchet](https://github.com/hatchet-dev/hatchet) we needed a reliable and performant way to durably persist messages over a message boundary. In particular, we needed:
 
-- **Batched reads and writes.** `AddMessages` inserts a batch of messages in a single transaction, and `ProcessMessages` locks a batch, hands the whole batch to one `Flush` call, and deletes it in the same transaction (see [Atomic flush and delete](#atomic-flush-and-delete) and [Benchmarks](#benchmarks)).
-- **Exclusive consumers with leasing semantics.** Exactly one instance across a fleet owns a topic under a renewing lease, and a standby takes over within seconds if the holder goes away (see [Exclusive consumers](#exclusive-consumers)).
+- **Batched reads and writes.** See [Atomic flush and delete](#atomic-flush-and-delete) and [Benchmarks](#benchmarks).
+- **Exclusive consumers with leasing semantics.** see [Exclusive consumers](#exclusive-consumers).
 - **Support for publishing across hundreds of thousands of topics.** Topics are plain strings that don't need to be declared up front, and they're tracked in a table rather than by a poller or worker pool per topic (see [Multiple topics and flushers](#multiple-topics-and-flushers) and [Message expiration](#message-expiration)).
 
 Without these particular requirements, a library like [River](https://github.com/riverqueue/river) would otherwise have been a good fit. `pgoutbox` is deliberately an outbox rather than a job queue: there are no retries, scheduling, priorities, or job history, and messages are deleted as soon as they're flushed.
