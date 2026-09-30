@@ -4,19 +4,21 @@
 
 `pgoutbox` implements a simple [transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) for [`pgx`](https://github.com/jackc/pgx). New messages can be added to a Postgres table within a transaction using `AddMessages` and can be flushed to a destination via `ProcessMessages`.
 
+<img width="1662" height="922" alt="pgoutbox" src="https://github.com/user-attachments/assets/d678f370-c12f-4615-b961-33b045119484" />
+
 ## Why?
 
-While working on [Hatchet](https://github.com/hatchet-dev/hatchet) we needed a reliable and performant way to durably persist messages over a message boundary. In particular, we needed:
+While working on [Hatchet](https://github.com/hatchet-dev/hatchet) we needed a reliable and performant way to durably persist messages over a message boundary using Postgres. In particular, we needed:
 
-- **Batched reads and writes.** `AddMessages` inserts a batch of messages in a single transaction, and `ProcessMessages` locks a batch, hands the whole batch to one `Flush` call, and deletes it in the same transaction (see [Atomic flush and delete](#atomic-flush-and-delete) and [Benchmarks](#benchmarks)).
-- **Exclusive consumers with leasing semantics.** Exactly one instance across a fleet owns a topic under a renewing lease, and a standby takes over within seconds if the holder goes away (see [Exclusive consumers](#exclusive-consumers)).
+- **Batched reads and writes.** See [Atomic flush and delete](#atomic-flush-and-delete) and [Benchmarks](#benchmarks).
+- **Exclusive consumers with leasing semantics.** see [Exclusive consumers](#exclusive-consumers).
 - **Support for publishing across hundreds of thousands of topics.** Topics are plain strings that don't need to be declared up front, and they're tracked in a table rather than by a poller or worker pool per topic (see [Multiple topics and flushers](#multiple-topics-and-flushers) and [Message expiration](#message-expiration)).
 
 Without these particular requirements, a library like [River](https://github.com/riverqueue/river) would otherwise have been a good fit. `pgoutbox` is deliberately an outbox rather than a job queue: there are no retries, scheduling, priorities, or job history, and messages are deleted as soon as they're flushed.
 
 ## Example usage
 
-Here's an example of flushing messages on `topic1` by simply printing them to the console:
+For a full working example, see [./examples](./examples). Here's an example of flushing messages on `topic1` by simply printing them to the console:
 
 ```go
 type printFlusher struct{}
