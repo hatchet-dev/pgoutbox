@@ -18,13 +18,15 @@ type PubSubMessage struct {
 }
 
 // PubSub is a minimal publish/subscribe transport for small notification
-// messages. The outbox uses it (via WithPubSub) to wake Subscribe callers as
-// soon as new messages are staged, instead of waiting out a poll interval.
+// messages. The outbox uses it via WithPubSub to wake Subscribe callers as soon
+// as new messages commit, instead of waiting out the poll interval. NewPGPubSub
+// provides an implementation built on Postgres LISTEN/NOTIFY, and you can swap
+// in your own transport by implementing this interface.
 //
-// Delivery is expected to be best-effort: implementations may drop messages
-// under load or while disconnected. The outbox tolerates both lost messages
-// (Subscribe falls back to polling) and duplicate or spurious messages (an
-// extra processing pass on an empty topic is a no-op).
+// Delivery is best-effort by design. Implementations may drop messages under
+// load or while disconnected: the outbox falls back to polling for lost
+// messages, and an extra processing pass on an empty topic is a no-op, so
+// duplicate or spurious messages are harmless.
 type PubSub interface {
 	// Pub publishes payload to topic.
 	Pub(ctx context.Context, topic string, payload []byte) error
@@ -38,12 +40,12 @@ type PubSub interface {
 }
 
 // TxPublisher is an optional interface a PubSub can implement to publish
-// within a pgx transaction. When the PubSub configured via WithPubSub
-// implements it (detected once, at NewOutbox), AddMessages publishes its
-// new-message notification inside the caller's transaction, so the
-// notification is delivered exactly when the insert commits — and never for a
-// transaction that rolls back. Without it, the notification is deferred to a
-// Notifier the caller passes via WithNotifier and invokes after commit.
+// within a pgx transaction. A notification only makes sense once the inserting
+// transaction has committed. When the PubSub passed to WithPubSub implements
+// TxPublisher, AddMessages publishes its notification inside the caller's
+// transaction, so it is delivered exactly when the insert commits and never for
+// a transaction that rolls back. A PubSub that doesn't implement it needs to
+// defer notifying until after commit; see WithNotifier.
 type TxPublisher interface {
 	PubInTx(ctx context.Context, tx pgx.Tx, topic string, payload []byte) error
 }

@@ -20,9 +20,10 @@ import (
 )
 
 // FlushContext is the context passed to Flusher.Flush. It embeds
-// context.Context and exposes the transaction that ProcessMessages uses to
-// lock and delete messages. Callers that want their writes to commit
-// atomically with the outbox delete can enlist in that transaction via Tx().
+// context.Context, so flushers that don't need the transaction can treat it as
+// a plain context. Tx returns the transaction ProcessMessages uses to lock and
+// delete messages. Flushers that write to Postgres themselves can use it so
+// their writes and the outbox delete commit or roll back together.
 type FlushContext interface {
 	context.Context
 	Tx() pgx.Tx
@@ -35,68 +36,106 @@ type flushContext struct {
 
 func (f *flushContext) Tx() pgx.Tx { return f.tx }
 
+// Flusher delivers a batch of messages to their destination. Register one per
+// topic with Outbox.AddFlusher. ProcessMessages calls Flush with the messages it
+// has locked for the topic and deletes them only if Flush returns nil. If Flush
+// returns an error, the messages stay in the outbox and are retried on the next
+// call.
+//
+// Flushers that write to Postgres can use ctx.Tx() so that their writes and the
+// outbox delete commit or roll back together.
 type Flusher interface {
 	Flush(ctx FlushContext, msgs []*sqlc.Message) error
 }
 
+// MessageOpts describes a single message to add via Outbox.AddMessages.
 type MessageOpts struct {
+	// Payload is the opaque message body. It is stored as-is and handed back to
+	// the Flusher unchanged.
 	Payload []byte
 }
 
+// Outbox is a transactional outbox: messages are added to a Postgres table
+// within the caller's transaction and later flushed to a destination by the
+// Flusher registered for their topic. Create one with NewOutbox.
+//
+// Topics are plain strings and don't need to be declared up front. Any number
+// of topics can be used, and every topic that receives a message is tracked
+// automatically.
 type Outbox interface {
+	// AddFlusher registers the Flusher that ProcessMessages and Subscribe use to
+	// drain topic. Registering a flusher for a topic that already has one
+	// replaces it.
 	AddFlusher(topic string, flusher Flusher)
 
-	// AddMessages stages msgs on the topic within the caller's transaction.
-	// When a PubSub is configured, it also arranges the new-message
-	// notification that wakes Subscribe callers: TxPublisher transports
-	// publish it on tx itself, and generic transports hand it to the Notifier
-	// passed via WithNotifier, for the caller to fire after commit (see
-	// Notifier). Skipping the option never loses messages, it only leaves
-	// generic transports waiting out Subscribe's poll interval.
+	// AddMessages adds msgs to the topic within the caller's transaction. The
+	// messages become visible to ProcessMessages once tx commits, and are
+	// discarded if it rolls back.
+	//
+	// When the outbox was built with WithPubSub, AddMessages also notifies
+	// subscribers of the topic. A TxPublisher such as NewPGPubSub publishes the
+	// notification inside tx, so it is delivered exactly when the transaction
+	// commits. Other PubSub implementations need to defer the notification
+	// until after commit: pass a Notifier via WithNotifier and call Notify once
+	// the transaction has committed. Skipping the notification never loses
+	// messages; subscribers pick them up on their next poll.
 	AddMessages(ctx context.Context, tx pgx.Tx, topic string, msgs []MessageOpts, opts ...AddOpt) error
 
-	// ProcessMessages grabs a batch of messages for the given topic, flushes them using the registered Flusher for that
-	// topic, and deletes them from the outbox if the flush is successful. If the topic has an active exclusive consumer,
-	// the calling instance must hold the exclusive lease (via AcquireTopic) or an error is returned.
+	// ProcessMessages grabs a batch of messages for the topic, flushes them
+	// using the registered Flusher, and deletes them from the outbox in the
+	// same transaction if the flush succeeds. It returns the flushed messages,
+	// or nil if the topic was empty. The batch size defaults to 1000 and can be
+	// changed with WithBatchSize.
+	//
+	// Messages are locked with FOR UPDATE SKIP LOCKED, so any number of callers
+	// can drain a topic concurrently. If the topic has an active exclusive
+	// consumer, the caller must hold the lease via AcquireTopic; otherwise
+	// ErrExclusiveLeaseHeld or ErrExclusiveLeaseRequired is returned.
 	ProcessMessages(ctx context.Context, topic string, opts ...ProcessOpt) ([]*sqlc.Message, error)
 
-	// Subscribe blocks and continuously drains the topic: it runs
-	// ProcessMessages until the topic is empty, then waits for the poll
-	// interval to elapse — or, when the outbox was built with WithPubSub, for
-	// a new-message notification — and drains again. Processing errors are
-	// logged to the WithLogger logger and retried on the next wake-up; as
-	// with ProcessMessages, topics with an active exclusive consumer require
-	// AcquireTopic first — either call it beforehand, or pass WithExclusive
-	// to have Subscribe acquire, re-acquire, and release the lease itself.
-	// Returns ctx.Err() when ctx ends, or an error immediately if no flusher
-	// is registered for the topic, the PubSub subscription cannot be
-	// established, or the WithExclusive initial acquisition fails.
+	// Subscribe drains the topic automatically by listening for a poll or a
+	// new-message notification. It runs ProcessMessages until the topic is
+	// empty, then waits for the poll interval (see WithPollInterval) or, when
+	// the outbox was built with WithPubSub, for a new-message notification, and
+	// drains again. It blocks until ctx is cancelled and then returns ctx.Err().
+	//
+	// If processing fails, the error is logged to the WithLogger logger and the
+	// messages are retried on the next wake-up. Subscribe returns an error
+	// immediately only if no flusher is registered for the topic, the PubSub
+	// subscription can't be established, or the initial lease acquisition for
+	// WithExclusive fails.
+	//
+	// As with ProcessMessages, a topic with an active exclusive consumer
+	// requires the lease. Either call AcquireTopic before Subscribe or pass
+	// WithExclusive to have Subscribe manage the lease itself.
 	Subscribe(ctx context.Context, topic string, opts ...SubscribeOpt) error
 
-	// AcquireTopic blocks until this instance holds the exclusive processing lease
-	// for the named topic, then returns. A background goroutine automatically renews
-	// the lease until ctx is cancelled or ReleaseTopic is called, at which point the
-	// lease expires naturally and another instance can take over. AcquireTopic must
-	// be called before ProcessMessages for any topic that has an active exclusive
-	// consumer.
+	// AcquireTopic blocks until this instance holds the exclusive lease for the
+	// topic, then returns. A background goroutine automatically renews the
+	// lease until ctx is cancelled or ReleaseTopic is called, at which point
+	// the lease expires and another instance can take over.
+	//
+	// Once a topic has an exclusive consumer, only the lease holder may call
+	// ProcessMessages for it. Other instances receive ErrExclusiveLeaseHeld, and
+	// an instance whose lease has expired receives ErrExclusiveLeaseRequired
+	// until it calls AcquireTopic again.
 	AcquireTopic(ctx context.Context, topic string) error
 
-	// ReleaseTopic stops renewing and immediately expires the exclusive lease
-	// this instance holds for topic, letting another instance acquire it right
-	// away instead of waiting out the lease duration. It is a no-op if this
-	// instance does not currently hold the lease. As with a naturally expired
-	// lease, a subsequent ProcessMessages call still requires an explicit
-	// AcquireTopic first.
+	// ReleaseTopic stops renewing the exclusive lease this instance holds for
+	// topic and expires it immediately, so a waiting instance can take over
+	// right away instead of waiting out the lease duration. It is a no-op if
+	// this instance does not hold the lease. A later ProcessMessages call for
+	// the topic requires AcquireTopic again.
 	ReleaseTopic(ctx context.Context, topic string) error
 }
 
 // ErrExclusiveLeaseHeld is returned by ProcessMessages when another outbox
-// instance currently holds a valid exclusive lease for the topic.
+// instance currently holds the exclusive lease for the topic.
 var ErrExclusiveLeaseHeld = errors.New("exclusive lease held by another instance")
 
 // ErrExclusiveLeaseRequired is returned by ProcessMessages when the topic has
-// an exclusive-consumer record but this instance does not hold a live lease —
-// either AcquireTopic was never called or the lease has since expired.
+// an exclusive consumer but this instance does not hold a live lease, either
+// because AcquireTopic was never called or because the lease has expired.
 var ErrExclusiveLeaseRequired = errors.New("exclusive lease required: call AcquireTopic first")
 
 // defaultBatchSize is the number of messages ProcessMessages will pull per
@@ -110,35 +149,34 @@ type addOpts struct {
 	notifier *Notifier
 }
 
-// WithNotifier has AddMessages collect its post-commit notification into n
-// instead of dropping it. Only generic (non-TxPublisher) PubSubs need it —
-// they have no way to defer a publish to commit time, so the caller carries
-// the notification past the transaction and fires it with Notify. One
-// Notifier can be shared by every AddMessages call in a transaction and
-// fired once after commit.
+// WithNotifier has AddMessages record its new-message notification in n so the
+// caller can publish it after the transaction commits. It is only needed for
+// PubSub implementations that don't implement TxPublisher, since those can't
+// defer publishing to commit time. One Notifier can be shared by every
+// AddMessages call in a transaction and fired once with Notify after commit.
 func WithNotifier(n *Notifier) AddOpt {
 	return func(opts *addOpts) {
 		opts.notifier = n
 	}
 }
 
-// Notifier accumulates the new-message notifications of the AddMessages calls
-// it is passed to (via WithNotifier), so they can be published once the
-// staging transaction has committed. The zero value is ready to use; it is
-// not safe for concurrent use, mirroring the pgx.Tx it accompanies.
+// Notifier accumulates the new-message notifications from the AddMessages
+// calls it is passed to via WithNotifier, so they can be published once the
+// transaction has committed. The zero value is ready to use. Like the pgx.Tx it
+// accompanies, it is not safe for concurrent use.
 type Notifier struct {
 	hooks []func(context.Context)
 }
 
-// Notify publishes the accumulated notifications. Invoke it once, after the
-// transaction commits successfully; after a rollback, simply discard the
-// Notifier. It is a no-op when there is nothing to publish — no PubSub
-// configured, no messages staged, or a TxPublisher transport that already
-// published on the transaction. Publishing is best-effort: failures are
-// logged to the WithLogger logger, not returned, since durably staged
-// messages are picked up by Subscribe's polling fallback regardless. Calling
-// it more than once just repeats the wake-ups (harmless, like any spurious
-// notification).
+// Notify publishes the accumulated notifications. Call it once after the
+// transaction commits successfully. After a rollback, discard the Notifier
+// instead. Notify is a no-op when there is nothing to publish, including when
+// the PubSub implements TxPublisher and already published on the transaction.
+//
+// Delivery is best-effort by design: failures are logged to the WithLogger
+// logger rather than returned, since subscribers fall back to polling and pick
+// the messages up regardless. Calling Notify more than once only repeats the
+// wake-ups, which is harmless.
 func (n *Notifier) Notify(ctx context.Context) {
 	for _, hook := range n.hooks {
 		hook(ctx)
@@ -156,9 +194,9 @@ func defaultProcessOpts() *processOpts {
 	return &processOpts{batchSize: defaultBatchSize}
 }
 
-// WithBatchSize sets the maximum number of messages ProcessMessages will
-// acquire and hand to the Flusher in a single call. Must be > 0. Values
-// above math.MaxInt32 are ignored and the default (1000) is used instead.
+// WithBatchSize sets the maximum number of messages ProcessMessages locks and
+// hands to the Flusher in a single call. Defaults to 1000. Values that are not
+// positive or that exceed math.MaxInt32 are ignored.
 func WithBatchSize(n int) ProcessOpt {
 	return func(opts *processOpts) {
 		if n <= 0 || n > math.MaxInt32 {
@@ -297,71 +335,75 @@ type outboxImpl struct {
 	managed   map[string]*managedTopic
 }
 
+// OutboxOpt configures NewOutbox and Migrate.
 type OutboxOpt func(*outboxImplOpts)
 
-func WithSchema(searchPath string) OutboxOpt {
+// WithSchema sets the Postgres schema that holds the outbox tables. Defaults to
+// "outbox". The schema is created if it doesn't exist when migrations run.
+func WithSchema(schema string) OutboxOpt {
 	return func(opts *outboxImplOpts) {
-		opts.schema = searchPath
+		opts.schema = schema
 	}
 }
 
-// WithAutoMigrate controls whether NewOutbox runs the embedded migrations on
-// construction. Defaults to true. Set to false when the caller wants to run
-// migrations explicitly via Migrate (for example, in a separate startup
-// phase or release pipeline).
+// WithAutoMigrate controls whether NewOutbox runs the embedded migrations.
+// Defaults to true. Set it to false to run migrations yourself by calling
+// Migrate, for example as part of a separate release step.
 func WithAutoMigrate(enabled bool) OutboxOpt {
 	return func(opts *outboxImplOpts) {
 		opts.autoMigrate = enabled
 	}
 }
 
-// WithTopicExpiration registers a TTL for the named topic. On Start, the TTL is
-// written to the topics table so that any outbox instance can discover it.
-// Messages older than ttl are eligible for deletion by the background maintenance
-// goroutine launched by Start. Per-topic TTLs take precedence over
-// WithDefaultExpiration.
+// WithTopicExpiration sets how long messages on topic are kept before the
+// background maintenance goroutines delete them. NewOutbox writes the
+// expiration to the topics table so that every outbox instance can discover
+// it. Per-topic expirations take precedence over WithDefaultExpiration.
 func WithTopicExpiration(topic string, ttl time.Duration) OutboxOpt {
 	return func(opts *outboxImplOpts) {
 		opts.expirations[topic] = ttl
 	}
 }
 
-// WithDefaultExpiration sets a fallback TTL used for topics that have no
-// specific expiration configured via WithTopicExpiration. Any topic that
-// appears in the topics table with a NULL expiration_nanos will be maintained
-// using this TTL when Start is running.
+// WithDefaultExpiration sets the expiration for topics that have none
+// configured via WithTopicExpiration. Topics don't need to be declared at
+// startup: every topic that receives a message is tracked in the topics table
+// and picks up the default automatically. Without a default, topics that have
+// no explicit expiration are never expired.
 func WithDefaultExpiration(ttl time.Duration) OutboxOpt {
 	return func(opts *outboxImplOpts) {
 		opts.defaultExpiration = ttl
 	}
 }
 
-// WithLogger attaches a zerolog logger that receives error-level messages from
-// the background maintenance goroutines. Lease competition (another instance
-// holding the lease) is not logged. If not set, maintenance errors are silent.
+// WithLogger attaches a zerolog logger that receives errors from the
+// background maintenance goroutines, from Subscribe's processing passes, and
+// from Notifier.Notify. If not set, those errors are silent.
 func WithLogger(l zerolog.Logger) OutboxOpt {
 	return func(opts *outboxImplOpts) {
 		opts.logger = l
 	}
 }
 
-// WithPubSub attaches a PubSub used to cut end-to-end latency: AddMessages
-// publishes a notification for each staged topic and Subscribe wakes on those
-// notifications instead of waiting out its poll interval. Delivery is
-// best-effort — Subscribe's polling remains the fallback for lost
-// notifications. If ps also implements TxPublisher (NewPGPubSub does), the
-// notification is published inside the AddMessages transaction and delivered
-// exactly when it commits; otherwise pass a Notifier to AddMessages via
-// WithNotifier and invoke Notify after committing.
+// WithPubSub attaches a PubSub that wakes Subscribe callers the moment new
+// messages commit, instead of waiting out the poll interval. NewPGPubSub
+// provides an implementation built on Postgres LISTEN/NOTIFY.
+//
+// Delivery is best-effort by design; if a notification is lost, Subscribe falls
+// back to polling. If ps implements TxPublisher, the notification is published
+// inside the AddMessages transaction. Otherwise, pass a Notifier to AddMessages
+// via WithNotifier and call Notify after commit.
 func WithPubSub(ps PubSub) OutboxOpt {
 	return func(opts *outboxImplOpts) {
 		opts.pubsub = ps
 	}
 }
 
-// NewOutbox creates an outbox backed by pool and starts the background
-// maintenance goroutines. The goroutines run until ctx is cancelled; pass a
-// context tied to your application lifetime (e.g. from signal.NotifyContext).
+// NewOutbox creates an outbox backed by pool. By default it runs the embedded
+// migrations, creating the outbox tables in the "outbox" schema (see WithSchema
+// and WithAutoMigrate), and starts the background maintenance goroutines that
+// delete expired messages. The goroutines run until ctx is cancelled, so pass a
+// context tied to your application lifetime.
 func NewOutbox(ctx context.Context, pool *pgxpool.Pool, fs ...OutboxOpt) (Outbox, error) {
 	opts := defaultOpts()
 

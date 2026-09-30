@@ -26,7 +26,8 @@ func defaultSubscribeOpts() *subscribeOpts {
 }
 
 // WithPollInterval sets how long Subscribe waits between processing passes
-// when no new-message notification arrives. Must be > 0.
+// when no new-message notification arrives. Defaults to 5 seconds. Values that
+// are not positive are ignored.
 func WithPollInterval(d time.Duration) SubscribeOpt {
 	return func(opts *subscribeOpts) {
 		if d <= 0 {
@@ -36,22 +37,23 @@ func WithPollInterval(d time.Duration) SubscribeOpt {
 	}
 }
 
-// WithProcessOpts forwards per-call ProcessMessages options (e.g.
-// WithBatchSize) to every processing pass Subscribe makes.
+// WithProcessOpts forwards ProcessMessages options such as WithBatchSize to
+// every processing pass Subscribe makes.
 func WithProcessOpts(popts ...ProcessOpt) SubscribeOpt {
 	return func(opts *subscribeOpts) {
 		opts.processOpts = append(opts.processOpts, popts...)
 	}
 }
 
-// WithExclusive makes Subscribe manage the topic's exclusive-consumer lease
-// for the duration of the call: it acquires the lease before the first
-// processing pass (blocking, like AcquireTopic, while another instance holds
-// it), re-acquires it if it is ever lost mid-subscribe, and releases it on
-// return so a waiting instance can take over immediately instead of waiting
-// out the lease's grace period. Several instances calling Subscribe with
-// WithExclusive on the same topic therefore form a failover group: exactly
-// one drains the topic while the rest block in line behind the lease.
+// WithExclusive has Subscribe manage the topic's exclusive lease for the
+// duration of the call. Subscribe then acquires the lease before its first
+// processing pass, blocking while another instance holds it (like
+// AcquireTopic); re-acquires it automatically if it is ever lost
+// mid-subscribe; and releases it on return, so a waiting instance takes over
+// immediately instead of waiting out the lease duration.
+//
+// Several instances calling Subscribe with WithExclusive on the same topic
+// therefore form a failover group: one active consumer, the rest hot standbys.
 func WithExclusive() SubscribeOpt {
 	return func(opts *subscribeOpts) {
 		opts.exclusive = true

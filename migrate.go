@@ -30,14 +30,13 @@ func validateSchemaName(schema string) error {
 	return nil
 }
 
-// Migrate runs the embedded pgoutbox migrations against the given pool.
-// It is the explicit alternative to NewOutbox's auto-migration: callers
-// that want to control when DDL runs (separate startup phase, release
-// pipeline, etc.) should construct the outbox with WithAutoMigrate(false)
-// and invoke Migrate themselves.
+// Migrate runs the embedded pgoutbox migrations against pool, creating the
+// schema if needed. NewOutbox runs them automatically by default. To run them
+// yourself instead, for example as part of a separate release step, construct
+// the outbox with WithAutoMigrate(false) and call Migrate explicitly.
 //
-// Only WithSchema is consulted from opts; other options are accepted for
-// API symmetry but ignored.
+// Only WithSchema is consulted from opts. Other options are accepted so the
+// same option list can be passed to NewOutbox, but they are ignored here.
 func Migrate(ctx context.Context, pool *pgxpool.Pool, opts ...OutboxOpt) error {
 	o := defaultOpts()
 	for _, f := range opts {
