@@ -4,6 +4,8 @@
 
 `pgoutbox` implements a simple [transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) for [`pgx`](https://github.com/jackc/pgx). New messages can be added to a Postgres table within a transaction using `AddMessages` and can be flushed to a destination via `ProcessMessages`.
 
+<img width="1662" height="922" alt="pgoutbox" src="https://github.com/user-attachments/assets/d678f370-c12f-4615-b961-33b045119484" />
+
 ## Why?
 
 While working on [Hatchet](https://github.com/hatchet-dev/hatchet) we needed a reliable and performant way to durably persist messages over a message boundary using Postgres. In particular, we needed:
