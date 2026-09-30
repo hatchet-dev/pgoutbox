@@ -43,10 +43,10 @@ func defaultPGPubSubOpts() *pgPubSubOpts {
 // PGPubSubOpt configures the PubSub returned by NewPGPubSub.
 type PGPubSubOpt func(*pgPubSubOpts)
 
-// WithNotifyChannel overrides the Postgres NOTIFY channel the PubSub
-// multiplexes over. All messages on a channel are broadcast to every listener
-// of that channel, so two outboxes sharing a database (e.g. different
-// schemas) should use distinct channels to avoid spurious wake-ups.
+// WithNotifyChannel sets the Postgres LISTEN/NOTIFY channel that carries the
+// PubSub's messages. Defaults to "pgoutbox_pubsub". Two outboxes sharing a
+// database should use distinct channels so they don't wake each other's
+// subscribers.
 func WithNotifyChannel(name string) PGPubSubOpt {
 	return func(opts *pgPubSubOpts) {
 		opts.channel = name
@@ -54,8 +54,8 @@ func WithNotifyChannel(name string) PGPubSubOpt {
 }
 
 // WithNotifyLogger attaches a zerolog logger that receives errors from the
-// background listener (connection failures, malformed payloads). If not set,
-// those errors are silent.
+// background listener, such as connection failures and malformed payloads. If
+// not set, those errors are silent.
 func WithNotifyLogger(l zerolog.Logger) PGPubSubOpt {
 	return func(opts *pgPubSubOpts) {
 		opts.logger = l
@@ -90,15 +90,16 @@ type pgPubSub struct {
 }
 
 // NewPGPubSub returns a PubSub backed by Postgres LISTEN/NOTIFY on the given
-// pool. The background listener starts lazily on the first Sub call and runs
-// until ctx is cancelled; pass a context tied to your application lifetime.
+// pool. Pass it to WithPubSub to wake subscribers the moment new messages
+// commit. The background listener starts on the first Sub call and runs until
+// ctx is cancelled, so pass a context tied to your application lifetime.
 //
-// The returned PubSub implements TxPublisher, so an outbox configured with it
-// publishes new-message notifications transactionally: subscribers wake when
-// the staging transaction commits, and not at all if it rolls back.
+// The returned PubSub implements TxPublisher, so notifications are published
+// inside the AddMessages transaction: subscribers wake when it commits, and not
+// at all if it rolls back.
 //
-// NOTIFY payloads are capped by Postgres at roughly 8000 bytes; Pub returns
-// an error beyond that. The outbox's own notifications are empty.
+// Postgres caps NOTIFY payloads at roughly 8000 bytes, and Pub returns an error
+// beyond that. The outbox's own notifications carry no payload.
 func NewPGPubSub(ctx context.Context, pool *pgxpool.Pool, fs ...PGPubSubOpt) (PubSub, error) {
 	opts := defaultPGPubSubOpts()
 
