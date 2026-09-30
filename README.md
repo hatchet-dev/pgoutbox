@@ -16,7 +16,7 @@ Without these particular requirements, a library like [River](https://github.com
 
 ## Example usage
 
-Here's an example of flushing messages on `topic1` by simply printing them to the console:
+For a full working example, see [./examples](./examples). Here's an example of flushing messages on `topic1` by simply printing them to the console:
 
 ```go
 type printFlusher struct{}
