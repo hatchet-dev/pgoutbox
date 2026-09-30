@@ -1,7 +1,6 @@
 # `pgoutbox` - a transactional outbox for `pgx`
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/hatchet-dev/pgoutbox.svg)](https://pkg.go.dev/github.com/hatchet-dev/pgoutbox)
-[![Go Report Card](https://goreportcard.com/badge/github.com/hatchet-dev/pgoutbox)](https://goreportcard.com/report/github.com/hatchet-dev/pgoutbox)
 
 `pgoutbox` implements a simple [transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) for [`pgx`](https://github.com/jackc/pgx). New messages can be added to a Postgres table within a transaction using `AddMessages` and can be flushed to a destination via `ProcessMessages`.
 
