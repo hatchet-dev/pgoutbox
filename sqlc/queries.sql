@@ -10,6 +10,8 @@ SELECT
 FROM /*tmpl*/ messages /*tmpl*/
 WHERE
     topic = $1
+ORDER BY
+    id ASC
 LIMIT
     COALESCE(sqlc.narg('limit')::integer, 100)
 FOR UPDATE SKIP LOCKED;
