@@ -369,6 +369,92 @@ func TestExclusiveConsumer_ReleaseTopicsAllowsImmediateReacquire(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded, "ReleaseTopics must only release the topics it was given")
 }
 
+// TestExclusiveConsumer_ReleaseTopicsLockedTopicDoesNotHoldTheOthers: one topic
+// row locked by an in-flight flush must not keep the other topics in the same
+// release from expiring, and the grace-period write that follows a timed-out
+// release must not move an expiry that already landed back into the future.
+func TestExclusiveConsumer_ReleaseTopicsLockedTopicDoesNotHoldTheOthers(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	// Long lease: an invoices release that never landed would keep B waiting
+	// for this whole duration.
+	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(10 * time.Minute)
+	defer restoreDuration()
+	restoreRetry := pgoutbox.SetExclusiveLeaseRetryIntervalForTest(20 * time.Millisecond)
+	defer restoreRetry()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	obA.AddFlusher("orders", &blockingFlusher{entered: entered, proceed: proceed})
+	insertMessages(t, ctx, obA, "orders", 1)
+
+	require.NoError(t, obA.AcquireTopic(ctx, "orders"))
+	require.NoError(t, obA.AcquireTopic(ctx, "invoices"))
+
+	processDone := make(chan error, 1)
+	go func() {
+		_, err := obA.ProcessMessages(ctx, "orders")
+		processDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("flush did not reach the topic-row lock")
+	}
+
+	releaseErr := make(chan error, 1)
+	go func() {
+		releaseCtx, releaseCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer releaseCancel()
+		releaseErr <- obA.ReleaseTopics(releaseCtx, []string{"orders", "invoices"})
+	}()
+
+	invoiceExpiry := fmt.Sprintf("SELECT exclusive_consumer_expires_at FROM %s.topics WHERE topic = 'invoices'", schema)
+	require.Eventually(t, func() bool {
+		var expiresAt *time.Time
+		err := sharedPool.QueryRow(ctx, invoiceExpiry).Scan(&expiresAt)
+		return err == nil && expiresAt != nil && expiresAt.Before(time.Now())
+	}, 2*time.Second, 20*time.Millisecond, "the unlocked topic must be released while the other topic's row is locked")
+
+	// Covers the release deadline and the grace-period write that follows it.
+	time.Sleep(500 * time.Millisecond)
+
+	var expiresAt *time.Time
+	require.NoError(t, sharedPool.QueryRow(ctx, invoiceExpiry).Scan(&expiresAt))
+	require.NotNil(t, expiresAt)
+	require.True(t, expiresAt.Before(time.Now()), "grace fallback extended a release that already landed, expires at %s", expiresAt)
+
+	acquireCtx, acquireCancel := context.WithTimeout(ctx, 2*time.Second)
+	require.NoError(t, obB.AcquireTopic(acquireCtx, "invoices"))
+	acquireCancel()
+
+	close(proceed)
+
+	select {
+	case err := <-releaseErr:
+		require.Error(t, err, "the locked topic's release must still time out")
+	case <-ctx.Done():
+		t.Fatal("release did not return")
+	}
+	select {
+	case err := <-processDone:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal("flush did not return")
+	}
+}
+
 // TestExclusiveConsumer_ReleaseTopicsAfterAcquireContextCancelled: cancelling
 // the AcquireTopic ctx makes the watcher write a grace-period override that
 // keeps the lease alive for a full lease duration. A ReleaseTopics that

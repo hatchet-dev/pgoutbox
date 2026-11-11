@@ -213,11 +213,37 @@ WHERE topic = $1;
 
 -- name: RenewTopicsExclusiveConsumer :exec
 -- Sets the per-topic lease override on every listed topic this consumer
--- holds; topics held by another consumer are left untouched. Takes a list so
--- that an instance giving up many topics at once pays one round trip.
+-- holds. A NULL expiry means the lease lasts as long as the consumer session,
+-- so it counts as later than any concrete timestamp. LEAST keeps a later
+-- write from pushing an expiry further out: a grace-period write must not
+-- undo a release that already landed. Topics held by another consumer are
+-- left untouched.
 UPDATE /*tmpl*/ topics /*tmpl*/
-SET exclusive_consumer_expires_at = @exclusive_consumer_expires_at::timestamptz
+SET exclusive_consumer_expires_at = LEAST(
+    COALESCE(exclusive_consumer_expires_at, 'infinity'::timestamptz),
+    @exclusive_consumer_expires_at::timestamptz
+)
 WHERE topic = ANY(@topics::text[]) AND exclusive_consumer_id = @exclusive_consumer_id::uuid;
+
+-- name: RenewTopicsExclusiveConsumerSkipLocked :many
+-- RenewTopicsExclusiveConsumer for the rows this statement can lock right
+-- now. A topic another transaction holds is left out of the result, so the
+-- caller can write it afterwards without the lock keeping the rest of the
+-- list from getting an expiry.
+WITH locked AS (
+    SELECT topic
+    FROM /*tmpl*/ topics /*tmpl*/
+    WHERE topic = ANY(@topics::text[])
+      AND exclusive_consumer_id = @exclusive_consumer_id::uuid
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE /*tmpl*/ topics /*tmpl*/ AS t
+SET exclusive_consumer_expires_at = LEAST(
+    COALESCE(t.exclusive_consumer_expires_at, 'infinity'::timestamptz),
+    @exclusive_consumer_expires_at::timestamptz
+)
+WHERE t.topic IN (SELECT locked.topic FROM locked)
+RETURNING t.topic;
 
 -- name: UpsertConsumerSession :exec
 INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)

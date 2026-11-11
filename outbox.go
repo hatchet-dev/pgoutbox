@@ -129,10 +129,12 @@ type Outbox interface {
 	// the topic requires AcquireTopic again.
 	ReleaseTopic(ctx context.Context, topic string) error
 
-	// ReleaseTopics is ReleaseTopic for many topics at once. It expires every
-	// listed lease this instance holds in a single statement, so an instance
-	// handing off a large set of topics pays one round trip instead of one
-	// per topic. Topics this instance does not hold are skipped.
+	// ReleaseTopics is ReleaseTopic for any number of topics. One statement
+	// expires every listed lease this instance can lock; a topic another
+	// transaction holds is written afterwards, so that lock cannot keep the
+	// others from being released. A watcher whose AcquireTopic context has
+	// already ended still writes its own grace expiry first, and ReleaseTopics
+	// waits for that write. Topics this instance does not hold are skipped.
 	ReleaseTopics(ctx context.Context, topics []string) error
 }
 
@@ -623,9 +625,10 @@ func (o *outboxImpl) ReleaseTopic(ctx context.Context, topic string) error {
 	return o.ReleaseTopics(ctx, []string{topic})
 }
 
-// ReleaseTopics is ReleaseTopic for any number of topics, expiring all of
-// their leases in one statement. Every watcher is stopped before the write, so
-// no watcher's grace-period override can land after the release and undo it.
+// ReleaseTopics is ReleaseTopic for any number of topics. Every watcher is
+// stopped before the write. A watcher whose context has already ended gets to
+// finish its grace-period write first, and the release then moves the expiry
+// earlier.
 func (o *outboxImpl) ReleaseTopics(ctx context.Context, topics []string) error {
 	if slices.Contains(topics, "") {
 		return fmt.Errorf("topic must not be empty")
@@ -642,20 +645,65 @@ func (o *outboxImpl) ReleaseTopics(ctx context.Context, topics []string) error {
 	}
 
 	expiredAt := time.Now().UTC().Add(-time.Second)
-	err := o.queries.RenewTopicsExclusiveConsumer(ctx, dbwrap.New(o.pool, o.schema), sqlc.RenewTopicsExclusiveConsumerParams{
-		Topics:                     topics,
-		ExclusiveConsumerID:        o.instanceID,
-		ExclusiveConsumerExpiresAt: pgtype.Timestamptz{Time: expiredAt, Valid: true},
-	})
+	err := o.renewExclusiveLeases(ctx, topics, expiredAt)
 	if err != nil {
 		// The stopped watchers will never fire and the release write didn't
 		// land (typically: caller ctx already cancelled) — without this the
 		// leases would ride the session heartbeat forever. Degrades a failed
-		// immediate release into a natural grace-period lapse.
+		// immediate release into a natural grace-period lapse. Topics the
+		// release already expired stay expired: a grace write is never later
+		// than the expiry already stored.
 		o.expireExclusiveLeasesAfterGrace(context.WithoutCancel(ctx), orphaned)
 		return fmt.Errorf("release exclusive leases for %d topics: %w", len(topics), err)
 	}
 	return nil
+}
+
+// renewExclusiveLeases writes expiresAt onto every listed topic this instance
+// holds. Topics another transaction has locked are skipped and then written
+// on their own, so one lock cannot roll back the expiry of the rest. An
+// expiry already sooner than expiresAt is left where it is.
+func (o *outboxImpl) renewExclusiveLeases(ctx context.Context, topics []string, expiresAt time.Time) error {
+	wrapped := dbwrap.New(o.pool, o.schema)
+	expires := pgtype.Timestamptz{Time: expiresAt, Valid: true}
+
+	updated, err := o.queries.RenewTopicsExclusiveConsumerSkipLocked(ctx, wrapped, sqlc.RenewTopicsExclusiveConsumerSkipLockedParams{
+		Topics:                     topics,
+		ExclusiveConsumerID:        o.instanceID,
+		ExclusiveConsumerExpiresAt: expires,
+	})
+	if err != nil {
+		return err
+	}
+
+	remaining := topicsWithout(topics, updated)
+	if len(remaining) == 0 {
+		return nil
+	}
+
+	return o.queries.RenewTopicsExclusiveConsumer(ctx, wrapped, sqlc.RenewTopicsExclusiveConsumerParams{
+		Topics:                     remaining,
+		ExclusiveConsumerID:        o.instanceID,
+		ExclusiveConsumerExpiresAt: expires,
+	})
+}
+
+// topicsWithout returns the topics in topics that are not in updated, in their
+// original order.
+func topicsWithout(topics []string, updated []string) []string {
+	done := make(map[string]struct{}, len(updated))
+	for _, topic := range updated {
+		done[topic] = struct{}{}
+	}
+
+	remaining := make([]string, 0, len(topics))
+	for _, topic := range topics {
+		if _, ok := done[topic]; ok {
+			continue
+		}
+		remaining = append(remaining, topic)
+	}
+	return remaining
 }
 
 // tryAcquireTopicLease makes one attempt to claim the exclusive lease. Returns
@@ -735,11 +783,7 @@ func (o *outboxImpl) expireExclusiveLeasesAfterGrace(ctx context.Context, topics
 	defer cancel()
 
 	expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration.Load())
-	err := o.queries.RenewTopicsExclusiveConsumer(ctx, dbwrap.New(o.pool, o.schema), sqlc.RenewTopicsExclusiveConsumerParams{
-		Topics:                     topics,
-		ExclusiveConsumerID:        o.instanceID,
-		ExclusiveConsumerExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
-	})
+	err := o.renewExclusiveLeases(ctx, topics, expiresAt)
 	if err != nil {
 		o.logger.Error().Err(err).Strs("topics", topics).Msg("exclusive consumer: failed to write lease grace-period expiry")
 	}
