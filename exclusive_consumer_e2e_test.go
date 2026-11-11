@@ -330,6 +330,146 @@ func TestExclusiveConsumer_ReleaseTopicRevokesProcessMessagesAccess(t *testing.T
 	require.Error(t, err, "ProcessMessages must fail after the lease has been released")
 }
 
+func TestExclusiveConsumer_ReleaseTopicsAllowsImmediateReacquire(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	// Long lease duration: a listed topic that ReleaseTopics failed to clear
+	// would make B wait out this whole duration.
+	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(10 * time.Minute)
+	defer restoreDuration()
+	restoreRetry := pgoutbox.SetExclusiveLeaseRetryIntervalForTest(20 * time.Millisecond)
+	defer restoreRetry()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	for _, topic := range []string{"orders", "invoices", "refunds"} {
+		require.NoError(t, obA.AcquireTopic(ctx, topic))
+	}
+
+	require.NoError(t, obA.ReleaseTopics(ctx, []string{"orders", "invoices"}))
+
+	for _, topic := range []string{"orders", "invoices"} {
+		acquireCtx, acquireCancel := context.WithTimeout(ctx, 2*time.Second)
+		require.NoError(t, obB.AcquireTopic(acquireCtx, topic), "released topic %q must be acquirable right away", topic)
+		acquireCancel()
+	}
+
+	// A topic left out of the release is still A's.
+	heldCtx, heldCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer heldCancel()
+	err = obB.AcquireTopic(heldCtx, "refunds")
+	require.ErrorIs(t, err, context.DeadlineExceeded, "ReleaseTopics must only release the topics it was given")
+}
+
+// TestExclusiveConsumer_ReleaseTopicsAfterAcquireContextCancelled: cancelling
+// the AcquireTopic ctx makes the watcher write a grace-period override that
+// keeps the lease alive for a full lease duration. A ReleaseTopics that
+// follows the cancellation must still free the topics immediately, whether
+// its write races the watcher's or lands after it.
+func TestExclusiveConsumer_ReleaseTopicsAfterAcquireContextCancelled(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(10 * time.Minute)
+	defer restoreDuration()
+	restoreRetry := pgoutbox.SetExclusiveLeaseRetryIntervalForTest(20 * time.Millisecond)
+	defer restoreRetry()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	topics := []string{"orders", "invoices", "refunds"}
+
+	holdCtx, releaseHold := context.WithCancel(ctx)
+	for _, topic := range topics {
+		require.NoError(t, obA.AcquireTopic(holdCtx, topic))
+	}
+
+	releaseHold()
+	require.NoError(t, obA.ReleaseTopics(ctx, topics))
+
+	for _, topic := range topics {
+		acquireCtx, acquireCancel := context.WithTimeout(ctx, 2*time.Second)
+		require.NoError(t, obB.AcquireTopic(acquireCtx, topic), "topic %q must not be left on its grace-period override", topic)
+		acquireCancel()
+	}
+}
+
+func TestExclusiveConsumer_ReleaseTopicsLeavesOtherHoldersAlone(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	obA.AddFlusher("orders", &noopFlusher{})
+	insertMessages(t, ctx, obA, "orders", 2)
+
+	require.NoError(t, obA.AcquireTopic(ctx, "orders"))
+
+	// B holds neither topic: one belongs to A and the other has no row yet.
+	require.NoError(t, obB.ReleaseTopics(ctx, []string{"orders", "invoices"}))
+
+	msgs, err := obA.ProcessMessages(ctx, "orders")
+	require.NoError(t, err, "a release by a non-holder must not revoke the holder's lease")
+	assert.Len(t, msgs, 2)
+}
+
+func TestExclusiveConsumer_ReleaseTopicsRejectsEmptyTopic(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	ob.AddFlusher("orders", &noopFlusher{})
+	insertMessages(t, ctx, ob, "orders", 2)
+
+	require.NoError(t, ob.AcquireTopic(ctx, "orders"))
+
+	require.Error(t, ob.ReleaseTopics(ctx, []string{"orders", ""}))
+
+	msgs, err := ob.ProcessMessages(ctx, "orders")
+	require.NoError(t, err, "a rejected release must not release the valid topics it was given")
+	assert.Len(t, msgs, 2)
+}
+
+func TestExclusiveConsumer_ReleaseTopicsNoOpWithoutTopics(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	require.NoError(t, ob.ReleaseTopics(ctx, nil))
+}
+
 // noopFlusher is a Flusher that does nothing and always succeeds.
 type noopFlusher struct{}
 
@@ -647,6 +787,45 @@ func TestExclusiveConsumer_FailedReleaseDoesNotStrandLease(t *testing.T) {
 	defer acquireCancel()
 	require.NoError(t, obB.AcquireTopic(acquireCtx, "orders"),
 		"failed release stranded the lease: nothing left to expire it while the session heartbeat lives")
+}
+
+// TestExclusiveConsumer_FailedReleaseTopicsDoesNotStrandLeases is
+// TestExclusiveConsumer_FailedReleaseDoesNotStrandLease for the multi-topic
+// release: every topic whose watcher was stopped needs the fallback expiry.
+func TestExclusiveConsumer_FailedReleaseTopicsDoesNotStrandLeases(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	restoreDuration := pgoutbox.SetExclusiveLeaseDurationForTest(150 * time.Millisecond)
+	defer restoreDuration()
+	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(25 * time.Millisecond)
+	defer restoreRenew()
+	restoreRetry := pgoutbox.SetExclusiveLeaseRetryIntervalForTest(20 * time.Millisecond)
+	defer restoreRetry()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	obA, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+	obB, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	topics := []string{"orders", "invoices"}
+	for _, topic := range topics {
+		require.NoError(t, obA.AcquireTopic(ctx, topic))
+	}
+
+	cancelledCtx, cancelNow := context.WithCancel(ctx)
+	cancelNow()
+	require.Error(t, obA.ReleaseTopics(cancelledCtx, topics))
+
+	for _, topic := range topics {
+		acquireCtx, acquireCancel := context.WithTimeout(ctx, 5*time.Second)
+		require.NoError(t, obB.AcquireTopic(acquireCtx, topic),
+			"failed release stranded the lease for %q: nothing left to expire it while the session heartbeat lives", topic)
+		acquireCancel()
+	}
 }
 
 // TestExclusiveConsumer_AcquireRestoresMissingConsumerSession: an acquired

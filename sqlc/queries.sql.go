@@ -487,20 +487,23 @@ func (q *Queries) ReleaseMaintenanceLease(ctx context.Context, db DBTX, arg Rele
 	return err
 }
 
-const renewTopicExclusiveConsumer = `-- name: RenewTopicExclusiveConsumer :exec
+const renewTopicsExclusiveConsumer = `-- name: RenewTopicsExclusiveConsumer :exec
 UPDATE /*tmpl*/ topics /*tmpl*/
-SET exclusive_consumer_expires_at = $3
-WHERE topic = $1 AND exclusive_consumer_id = $2
+SET exclusive_consumer_expires_at = $1::timestamptz
+WHERE topic = ANY($2::text[]) AND exclusive_consumer_id = $3::uuid
 `
 
-type RenewTopicExclusiveConsumerParams struct {
-	Topic                      string             `json:"topic"`
-	ExclusiveConsumerID        *uuid.UUID         `json:"exclusive_consumer_id"`
+type RenewTopicsExclusiveConsumerParams struct {
 	ExclusiveConsumerExpiresAt pgtype.Timestamptz `json:"exclusive_consumer_expires_at"`
+	Topics                     []string           `json:"topics"`
+	ExclusiveConsumerID        uuid.UUID          `json:"exclusive_consumer_id"`
 }
 
-func (q *Queries) RenewTopicExclusiveConsumer(ctx context.Context, db DBTX, arg RenewTopicExclusiveConsumerParams) error {
-	_, err := db.Exec(ctx, renewTopicExclusiveConsumer, arg.Topic, arg.ExclusiveConsumerID, arg.ExclusiveConsumerExpiresAt)
+// Sets the per-topic lease override on every listed topic this consumer
+// holds; topics held by another consumer are left untouched. Takes a list so
+// that an instance giving up many topics at once pays one round trip.
+func (q *Queries) RenewTopicsExclusiveConsumer(ctx context.Context, db DBTX, arg RenewTopicsExclusiveConsumerParams) error {
+	_, err := db.Exec(ctx, renewTopicsExclusiveConsumer, arg.ExclusiveConsumerExpiresAt, arg.Topics, arg.ExclusiveConsumerID)
 	return err
 }
 

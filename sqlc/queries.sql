@@ -211,10 +211,13 @@ SET exclusive_consumer_id = $2,
     exclusive_consumer_expires_at = $3
 WHERE topic = $1;
 
--- name: RenewTopicExclusiveConsumer :exec
+-- name: RenewTopicsExclusiveConsumer :exec
+-- Sets the per-topic lease override on every listed topic this consumer
+-- holds; topics held by another consumer are left untouched. Takes a list so
+-- that an instance giving up many topics at once pays one round trip.
 UPDATE /*tmpl*/ topics /*tmpl*/
-SET exclusive_consumer_expires_at = $3
-WHERE topic = $1 AND exclusive_consumer_id = $2;
+SET exclusive_consumer_expires_at = @exclusive_consumer_expires_at::timestamptz
+WHERE topic = ANY(@topics::text[]) AND exclusive_consumer_id = @exclusive_consumer_id::uuid;
 
 -- name: UpsertConsumerSession :exec
 INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)
