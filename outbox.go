@@ -342,11 +342,6 @@ type outboxImpl struct {
 	// scanner goroutine; the mutex exists for test introspection.
 	managedMu sync.Mutex
 	managed   map[string]*managedTopic
-
-	// sessionExpiresAt is the expiry (unix nanos) of this instance's consumer
-	// session as last confirmed written: by the heartbeat, or by an acquire
-	// transaction that committed. Zero until the first write lands.
-	sessionExpiresAt atomic.Int64
 }
 
 // OutboxOpt configures NewOutbox and Migrate.
@@ -745,19 +740,25 @@ func (o *outboxImpl) tryAcquireTopicLease(ctx context.Context, topic string) (bo
 	}
 
 	// The lease written below is only as alive as our consumer session, so
-	// refresh the session in the same transaction unless a confirmed write
-	// already keeps it alive past half a lease. The heartbeat may not have
-	// landed yet (NewOutbox's initial upsert is best-effort — tables missing
-	// under WithAutoMigrate(false), transient DB error), and failing the
-	// acquire beats returning success for a lease that immediately reads as
-	// expired. Skipping it while fresh matters: every acquire upserts the same
-	// row, so a process acquiring thousands of topics at startup serializes on
-	// that row lock with a pooled connection held per waiter, which exhausts
-	// the caller's pool.
-	var sessionExpiresAt time.Time
-	if !o.sessionFresh() {
-		var err error
-		if sessionExpiresAt, err = o.upsertConsumerSessionIn(ctx, wrapped); err != nil {
+	// make sure the session outlives half a lease before writing it. The
+	// background heartbeat may not have landed yet (NewOutbox's initial upsert
+	// is best-effort — tables missing under WithAutoMigrate(false), transient
+	// DB error), and failing the acquire here beats returning success for a
+	// lease that immediately reads as expired.
+	//
+	// Read before writing: every acquire on this instance targets the same
+	// session row, so upserting unconditionally makes a process that acquires
+	// thousands of topics at once (a scheduler starting up) queue on that
+	// row's lock with a pooled connection held per waiter. The read never
+	// waits on that lock, and a committed expiry only moves forward (the only
+	// delete removes long-expired rows), so a fresh read stays true through
+	// this transaction's commit.
+	fresh, err := o.consumerSessionFreshIn(ctx, wrapped)
+	if err != nil {
+		return false, fmt.Errorf("read consumer session while acquiring topic %q: %w", topic, err)
+	}
+	if !fresh {
+		if err := o.upsertConsumerSessionIn(ctx, wrapped); err != nil {
 			return false, fmt.Errorf("refresh consumer session while acquiring topic %q: %w", topic, err)
 		}
 	}
@@ -775,9 +776,6 @@ func (o *outboxImpl) tryAcquireTopicLease(ctx context.Context, topic string) (bo
 
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit exclusive lease for topic %q: %w", topic, err)
-	}
-	if !sessionExpiresAt.IsZero() {
-		o.recordSessionExpiry(sessionExpiresAt)
 	}
 	return true, nil
 }
@@ -809,45 +807,29 @@ func (o *outboxImpl) expireExclusiveLeasesAfterGrace(ctx context.Context, topics
 // consumer_sessions, the single per-instance heartbeat that exclusive and
 // maintenance leases defer to for liveness.
 func (o *outboxImpl) upsertConsumerSession(ctx context.Context) error {
-	expiresAt, err := o.upsertConsumerSessionIn(ctx, dbwrap.New(o.pool, o.schema))
-	if err != nil {
-		return err
-	}
-	o.recordSessionExpiry(expiresAt)
-	return nil
+	return o.upsertConsumerSessionIn(ctx, dbwrap.New(o.pool, o.schema))
 }
 
-// upsertConsumerSessionIn writes the session and returns the expiry it wrote.
-// Inside a caller's transaction the write is not confirmed until commit, so
-// the caller records it.
-func (o *outboxImpl) upsertConsumerSessionIn(ctx context.Context, wrapped *dbwrap.Wrapper) (time.Time, error) {
+func (o *outboxImpl) upsertConsumerSessionIn(ctx context.Context, wrapped *dbwrap.Wrapper) error {
 	expiresAt := time.Now().UTC().Add(exclusiveLeaseDuration.Load())
-	err := o.queries.UpsertConsumerSession(ctx, wrapped, sqlc.UpsertConsumerSessionParams{
+	return o.queries.UpsertConsumerSession(ctx, wrapped, sqlc.UpsertConsumerSessionParams{
 		ConsumerID:                 o.instanceID,
 		ExpiresAt:                  pgtype.Timestamptz{Time: expiresAt, Valid: true},
 		MaintainsDefaultExpiration: o.defaultExpiration > 0,
 	})
-	return expiresAt, err
 }
 
-// recordSessionExpiry keeps the latest confirmed expiry; an out-of-order
-// writer must not move it backwards.
-func (o *outboxImpl) recordSessionExpiry(expiresAt time.Time) {
-	next := expiresAt.UnixNano()
-	for {
-		cur := o.sessionExpiresAt.Load()
-		if cur >= next || o.sessionExpiresAt.CompareAndSwap(cur, next) {
-			return
-		}
+// consumerSessionFreshIn reports whether this instance's committed session
+// expires more than half a lease from now. A missing row is not fresh.
+func (o *outboxImpl) consumerSessionFreshIn(ctx context.Context, wrapped *dbwrap.Wrapper) (bool, error) {
+	expiresAt, err := o.queries.GetConsumerSessionExpiresAt(ctx, wrapped, o.instanceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
 	}
-}
-
-// sessionFresh reports whether the session is confirmed to outlive half a
-// lease. Only expired rows are ever deleted (DeleteExpiredConsumerSessions),
-// so a confirmed future expiry cannot be lost before it passes.
-func (o *outboxImpl) sessionFresh() bool {
-	expiresAt := o.sessionExpiresAt.Load()
-	return expiresAt != 0 && time.Until(time.Unix(0, expiresAt)) > exclusiveLeaseDuration.Load()/2
+	if err != nil {
+		return false, err
+	}
+	return expiresAt.Valid && time.Until(expiresAt.Time) > exclusiveLeaseDuration.Load()/2, nil
 }
 
 // runConsumerSessionRenewer keeps this instance's consumer session fresh for

@@ -199,6 +199,21 @@ func (q *Queries) DeleteMessagesByIds(ctx context.Context, db DBTX, arg DeleteMe
 	return err
 }
 
+const getConsumerSessionExpiresAt = `-- name: GetConsumerSessionExpiresAt :one
+SELECT expires_at
+FROM /*tmpl*/ consumer_sessions /*tmpl*/
+WHERE consumer_id = $1
+`
+
+// A plain read, so it never waits on the row lock that a concurrent
+// UpsertConsumerSession holds; it sees the last committed expiry.
+func (q *Queries) GetConsumerSessionExpiresAt(ctx context.Context, db DBTX, consumerID uuid.UUID) (pgtype.Timestamptz, error) {
+	row := db.QueryRow(ctx, getConsumerSessionExpiresAt, consumerID)
+	var expires_at pgtype.Timestamptz
+	err := row.Scan(&expires_at)
+	return expires_at, err
+}
+
 const getMaintenanceCandidateTopics = `-- name: GetMaintenanceCandidateTopics :many
 WITH sessions AS MATERIALIZED (
     SELECT consumer_id, (expires_at < now())::boolean AS expired

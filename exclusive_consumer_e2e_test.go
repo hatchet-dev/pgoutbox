@@ -935,7 +935,6 @@ func TestExclusiveConsumer_AcquireRestoresMissingConsumerSession(t *testing.T) {
 	// Simulate the initial heartbeat never having landed.
 	_, err = sharedPool.Exec(ctx, fmt.Sprintf("DELETE FROM %s.consumer_sessions", schema))
 	require.NoError(t, err)
-	pgoutbox.ForgetConsumerSessionForTest(ob)
 
 	require.NoError(t, ob.AcquireTopic(ctx, "orders"))
 

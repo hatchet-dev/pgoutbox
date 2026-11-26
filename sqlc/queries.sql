@@ -245,6 +245,13 @@ SET exclusive_consumer_expires_at = LEAST(
 WHERE t.topic IN (SELECT locked.topic FROM locked)
 RETURNING t.topic;
 
+-- name: GetConsumerSessionExpiresAt :one
+-- A plain read, so it never waits on the row lock that a concurrent
+-- UpsertConsumerSession holds; it sees the last committed expiry.
+SELECT expires_at
+FROM /*tmpl*/ consumer_sessions /*tmpl*/
+WHERE consumer_id = $1;
+
 -- name: UpsertConsumerSession :exec
 INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)
 VALUES ($1, $2, $3)
