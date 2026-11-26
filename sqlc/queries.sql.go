@@ -199,6 +199,21 @@ func (q *Queries) DeleteMessagesByIds(ctx context.Context, db DBTX, arg DeleteMe
 	return err
 }
 
+const getConsumerSessionExpiresAt = `-- name: GetConsumerSessionExpiresAt :one
+SELECT expires_at
+FROM /*tmpl*/ consumer_sessions /*tmpl*/
+WHERE consumer_id = $1
+`
+
+// A plain read, so it never waits on the row lock that a concurrent
+// UpsertConsumerSession holds; it sees the last committed expiry.
+func (q *Queries) GetConsumerSessionExpiresAt(ctx context.Context, db DBTX, consumerID uuid.UUID) (pgtype.Timestamptz, error) {
+	row := db.QueryRow(ctx, getConsumerSessionExpiresAt, consumerID)
+	var expires_at pgtype.Timestamptz
+	err := row.Scan(&expires_at)
+	return expires_at, err
+}
+
 const getMaintenanceCandidateTopics = `-- name: GetMaintenanceCandidateTopics :many
 WITH sessions AS MATERIALIZED (
     SELECT consumer_id, (expires_at < now())::boolean AS expired
@@ -630,7 +645,7 @@ const upsertConsumerSession = `-- name: UpsertConsumerSession :exec
 INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)
 VALUES ($1, $2, $3)
 ON CONFLICT (consumer_id) DO UPDATE
-SET expires_at = EXCLUDED.expires_at,
+SET expires_at = GREATEST(consumer_sessions.expires_at, EXCLUDED.expires_at),
     maintains_default_expiration = EXCLUDED.maintains_default_expiration
 `
 
@@ -640,6 +655,8 @@ type UpsertConsumerSessionParams struct {
 	MaintainsDefaultExpiration bool               `json:"maintains_default_expiration"`
 }
 
+// GREATEST keeps a delayed upsert (computed before waiting on a connection or
+// row lock) from overwriting a newer expiry with an older one.
 func (q *Queries) UpsertConsumerSession(ctx context.Context, db DBTX, arg UpsertConsumerSessionParams) error {
 	_, err := db.Exec(ctx, upsertConsumerSession, arg.ConsumerID, arg.ExpiresAt, arg.MaintainsDefaultExpiration)
 	return err

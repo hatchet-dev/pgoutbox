@@ -245,9 +245,18 @@ SET exclusive_consumer_expires_at = LEAST(
 WHERE t.topic IN (SELECT locked.topic FROM locked)
 RETURNING t.topic;
 
+-- name: GetConsumerSessionExpiresAt :one
+-- A plain read, so it never waits on the row lock that a concurrent
+-- UpsertConsumerSession holds; it sees the last committed expiry.
+SELECT expires_at
+FROM /*tmpl*/ consumer_sessions /*tmpl*/
+WHERE consumer_id = $1;
+
 -- name: UpsertConsumerSession :exec
+-- GREATEST keeps a delayed upsert (computed before waiting on a connection or
+-- row lock) from overwriting a newer expiry with an older one.
 INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)
 VALUES ($1, $2, $3)
 ON CONFLICT (consumer_id) DO UPDATE
-SET expires_at = EXCLUDED.expires_at,
+SET expires_at = GREATEST(consumer_sessions.expires_at, EXCLUDED.expires_at),
     maintains_default_expiration = EXCLUDED.maintains_default_expiration;
