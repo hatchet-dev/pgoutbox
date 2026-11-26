@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1061,4 +1062,42 @@ func TestExclusiveConsumer_AcquireRefreshesAgingSession(t *testing.T) {
 	require.NoError(t, ob.AcquireTopic(ctx, "orders"))
 
 	assert.True(t, sessionExpiry().After(before), "acquire did not refresh an aging session")
+}
+
+// A delayed upsert (e.g. a heartbeat computed before waiting on the pool) must
+// not overwrite a newer committed expiry with an older one.
+func TestExclusiveConsumer_UpsertSessionNeverMovesExpiryBackwards(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	require.NoError(t, pgoutbox.Migrate(ctx, sharedPool, pgoutbox.WithSchema(schema)))
+
+	tx, err := sharedPool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", schema))
+	require.NoError(t, err)
+
+	q := sqlc.New()
+	consumerID := uuid.New()
+	later := time.Now().UTC().Add(time.Minute).Truncate(time.Microsecond)
+	earlier := later.Add(-30 * time.Second)
+
+	require.NoError(t, q.UpsertConsumerSession(ctx, tx, sqlc.UpsertConsumerSessionParams{
+		ConsumerID: consumerID,
+		ExpiresAt:  pgtype.Timestamptz{Time: later, Valid: true},
+	}))
+	require.NoError(t, q.UpsertConsumerSession(ctx, tx, sqlc.UpsertConsumerSessionParams{
+		ConsumerID: consumerID,
+		ExpiresAt:  pgtype.Timestamptz{Time: earlier, Valid: true},
+	}))
+
+	got, err := q.GetConsumerSessionExpiresAt(ctx, tx, consumerID)
+	require.NoError(t, err)
+	require.True(t, got.Valid)
+	assert.True(t, got.Time.Equal(later), "stale upsert moved expires_at backwards: got %v, want %v", got.Time, later)
 }

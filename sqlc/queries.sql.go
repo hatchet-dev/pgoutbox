@@ -645,7 +645,7 @@ const upsertConsumerSession = `-- name: UpsertConsumerSession :exec
 INSERT INTO /*tmpl*/ consumer_sessions /*tmpl*/ (consumer_id, expires_at, maintains_default_expiration)
 VALUES ($1, $2, $3)
 ON CONFLICT (consumer_id) DO UPDATE
-SET expires_at = EXCLUDED.expires_at,
+SET expires_at = GREATEST(consumer_sessions.expires_at, EXCLUDED.expires_at),
     maintains_default_expiration = EXCLUDED.maintains_default_expiration
 `
 
@@ -655,6 +655,8 @@ type UpsertConsumerSessionParams struct {
 	MaintainsDefaultExpiration bool               `json:"maintains_default_expiration"`
 }
 
+// GREATEST keeps a delayed upsert (computed before waiting on a connection or
+// row lock) from overwriting a newer expiry with an older one.
 func (q *Queries) UpsertConsumerSession(ctx context.Context, db DBTX, arg UpsertConsumerSessionParams) error {
 	_, err := db.Exec(ctx, upsertConsumerSession, arg.ConsumerID, arg.ExpiresAt, arg.MaintainsDefaultExpiration)
 	return err
