@@ -935,6 +935,7 @@ func TestExclusiveConsumer_AcquireRestoresMissingConsumerSession(t *testing.T) {
 	// Simulate the initial heartbeat never having landed.
 	_, err = sharedPool.Exec(ctx, fmt.Sprintf("DELETE FROM %s.consumer_sessions", schema))
 	require.NoError(t, err)
+	pgoutbox.ForgetConsumerSessionForTest(ob)
 
 	require.NoError(t, ob.AcquireTopic(ctx, "orders"))
 
@@ -987,4 +988,78 @@ func TestExclusiveConsumer_HonorsLegacyPerTopicTimestampLease(t *testing.T) {
 	msgs, err := ob.ProcessMessages(ctx, "orders")
 	require.NoError(t, err)
 	assert.Len(t, msgs, 2)
+}
+
+// A process acquiring many topics at once (a scheduler starting up) must not
+// write its consumer session once per acquire: every acquire would upsert the
+// same row, serializing on its lock with a pooled connection held per waiter.
+func TestExclusiveConsumer_AcquireSkipsFreshSessionWrite(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	// keep the heartbeat out of the window so only acquires could write the row
+	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(time.Hour)
+	defer restoreRenew()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	sessionVersion := func() string {
+		var xmin string
+		require.NoError(t, sharedPool.QueryRow(ctx,
+			fmt.Sprintf("SELECT xmin::text FROM %s.consumer_sessions", schema)).Scan(&xmin))
+		return xmin
+	}
+
+	before := sessionVersion()
+
+	for i := range 200 {
+		require.NoError(t, ob.AcquireTopic(ctx, fmt.Sprintf("orders-%d", i)))
+	}
+
+	assert.Equal(t, before, sessionVersion(), "acquires rewrote a session that was already fresh")
+
+	ob.AddFlusher("orders-0", &noopFlusher{})
+	insertMessages(t, ctx, ob, "orders-0", 1)
+	msgs, err := ob.ProcessMessages(ctx, "orders-0")
+	require.NoError(t, err)
+	assert.Len(t, msgs, 1)
+}
+
+// Once the confirmed session is within half a lease of expiring, an acquire
+// refreshes it in its own transaction rather than trusting a heartbeat that
+// may be late.
+func TestExclusiveConsumer_AcquireRefreshesAgingSession(t *testing.T) {
+	// No t.Parallel() — modifies global timing vars shared with other tests.
+
+	restoreRenew := pgoutbox.SetExclusiveLeaseRenewIntervalForTest(time.Hour)
+	defer restoreRenew()
+	restoreLease := pgoutbox.SetExclusiveLeaseDurationForTest(2 * time.Second)
+	defer restoreLease()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	schema := uniqueSchema(t)
+	ob, err := pgoutbox.NewOutbox(ctx, sharedPool, pgoutbox.WithSchema(schema))
+	require.NoError(t, err)
+
+	sessionExpiry := func() time.Time {
+		var expiresAt time.Time
+		require.NoError(t, sharedPool.QueryRow(ctx,
+			fmt.Sprintf("SELECT expires_at FROM %s.consumer_sessions", schema)).Scan(&expiresAt))
+		return expiresAt
+	}
+
+	before := sessionExpiry()
+
+	// past half the 2s lease, so the confirmed session no longer counts as fresh
+	time.Sleep(1200 * time.Millisecond)
+
+	require.NoError(t, ob.AcquireTopic(ctx, "orders"))
+
+	assert.True(t, sessionExpiry().After(before), "acquire did not refresh an aging session")
 }

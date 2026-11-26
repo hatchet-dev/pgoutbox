@@ -72,3 +72,9 @@ func ManagedTopicsForTest(o Outbox) []string {
 	}
 	return topics
 }
+
+// ForgetConsumerSessionForTest drops o's record of a confirmed session write,
+// as if NewOutbox's best-effort initial heartbeat had never landed.
+func ForgetConsumerSessionForTest(o Outbox) {
+	o.(*outboxImpl).sessionExpiresAt.Store(0)
+}
